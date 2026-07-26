@@ -15,6 +15,17 @@
 //! `all features + one France` rather than `all features + all of Europe`. The
 //! CHECKPOINT is what makes the freed blocks reusable rather than merely free.
 //!
+//! **Nothing here rewrites the whole table.** Deduplicating with
+//! `CREATE OR REPLACE TABLE features AS SELECT ... FROM features` has to
+//! materialise the new copy while the old one still exists, so it needs the
+//! table's size over again in free space -- another 103 GB at Europe scale, and
+//! it falls due at the very end of a fifty-minute load. So the size filter and
+//! the spatial `cell` are applied per region on the way in, and duplicates are
+//! deleted in place at the end. The cost is that features are cell-ordered only
+//! within a region rather than globally, which is most of the benefit anyway:
+//! regions are geographically disjoint, so a per-region sort already puts
+//! neighbours near neighbours.
+//!
 //! Note the division of labour: the extractor decided *whether* an object is
 //! drawable, and everything about *what it is* is decided here, in SQL, in one
 //! pass over a columnar table. Doing the classification per object during
@@ -48,9 +59,12 @@ pub fn run(con: &Connection, regions: &[String]) -> Result<(), Box<dyn std::erro
             name    VARCHAR,
             osm_id  BIGINT,
             geom    GEOMETRY,
-            min_x   DOUBLE, min_y DOUBLE, max_x DOUBLE, max_y DOUBLE
+            min_x   DOUBLE, min_y DOUBLE, max_x DOUBLE, max_y DOUBLE,
+            cell    BIGINT
          )",
     )?;
+    // Used by every per-region insert below to compute `cell`.
+    con.execute_batch(config::BIT_SPREAD_MACRO)?;
     for region in regions {
         let t0 = Instant::now();
         con.execute_batch(&format!(
@@ -74,28 +88,24 @@ pub fn run(con: &Connection, regions: &[String]) -> Result<(), Box<dyn std::erro
     }
 
     // Adjacent extracts overlap along their shared border, so the same way can
-    // arrive twice. Also drop anything too small to be seen by MAXZOOM, attach
-    // the spatial cell, and write the table back in cell order so that features
-    // near each other on the map are near each other on disk.
+    // arrive twice. Deleted in place -- see the note at the top of this file for
+    // why this is not a rewrite.
     let t0 = Instant::now();
     let before: i64 = con.query_row("SELECT count(*) FROM features", [], |r| r.get(0))?;
-    con.execute_batch(config::BIT_SPREAD_MACRO)?;
-    con.execute_batch(&format!(
-        r#"
-        CREATE OR REPLACE TABLE features AS
-        SELECT *, {cell} AS cell
-        FROM features
-        WHERE minzoom <= {MAXZOOM}
-        QUALIFY osm_id IS NULL
-             OR row_number() OVER (PARTITION BY layer, osm_id ORDER BY osm_id) = 1
-        ORDER BY cell
-        "#,
-        cell = config::cell_sql(2.0 * WORLD / (1u32 << MAXZOOM) as f64),
-    ))?;
+    con.execute_batch(
+        "DELETE FROM features WHERE rowid IN (
+             SELECT rowid FROM (
+                 SELECT rowid, row_number() OVER (
+                            PARTITION BY layer, osm_id ORDER BY rowid) AS rn
+                 FROM features WHERE osm_id IS NOT NULL
+             ) WHERE rn > 1
+         );
+         CHECKPOINT",
+    )?;
     let after: i64 = con.query_row("SELECT count(*) FROM features", [], |r| r.get(0))?;
     config::timed(
         format!(
-            "{} -> {} features, clustered by cell",
+            "{} -> {} features, duplicates removed",
             config::commas(before as u64),
             config::commas(after as u64)
         ),
@@ -116,6 +126,11 @@ pub fn run(con: &Connection, regions: &[String]) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
+/// Morton code of a feature's bbox centre on the MAXZOOM tile grid.
+fn cell() -> String {
+    config::cell_sql(2.0 * WORLD / (1u32 << MAXZOOM) as f64)
+}
+
 const TO_3857: &str =
     "ST_Transform(ST_GeomFromWKB(wkb), 'EPSG:4326', 'EPSG:3857', always_xy := true)";
 
@@ -134,16 +149,22 @@ fn classify_lines(con: &Connection) -> Result<(), Box<dyn std::error::Error>> {
                         WHEN waterway IN ('river', 'canal') THEN 'river'
                         ELSE 'stream' END AS cls
             FROM src
+        ), bounded AS (
+            SELECT layer, cls,
+                   CASE WHEN layer = 'roads' THEN {road_minzoom}
+                        WHEN cls = 'river' THEN 8
+                        ELSE {MAXZOOM} END AS minzoom,
+                   name, osm_id, geom,
+                   ST_XMin(geom) AS min_x, ST_YMin(geom) AS min_y,
+                   ST_XMax(geom) AS max_x, ST_YMax(geom) AS max_y
+            FROM classified
+            WHERE NOT ST_IsEmpty(geom)
         )
-        SELECT layer, cls,
-               CASE WHEN layer = 'roads' THEN {road_minzoom}
-                    WHEN cls = 'river' THEN 8
-                    ELSE {MAXZOOM} END AS minzoom,
-               name, osm_id, geom,
-               ST_XMin(geom), ST_YMin(geom), ST_XMax(geom), ST_YMax(geom)
-        FROM classified
-        WHERE NOT ST_IsEmpty(geom)
+        SELECT *, {cell} AS cell FROM bounded
+        WHERE minzoom <= {MAXZOOM}
+        ORDER BY cell
         "#,
+        cell = cell(),
         to_3857 = TO_3857,
         road_class = config::road_class_sql("highway"),
         road_minzoom = config::road_minzoom_sql("cls"),
@@ -175,13 +196,19 @@ fn classify_areas(con: &Connection) -> Result<(), Box<dyn std::error::Error>> {
             ) FROM src
         ), classified AS (
             SELECT osm_id, name, geom, {poly_class} AS cls FROM valid
+        ), bounded AS (
+            SELECT {poly_layer} AS layer, cls, {area_minzoom} AS minzoom,
+                   name, osm_id, geom,
+                   ST_XMin(geom) AS min_x, ST_YMin(geom) AS min_y,
+                   ST_XMax(geom) AS max_x, ST_YMax(geom) AS max_y
+            FROM classified
+            WHERE cls IS NOT NULL AND NOT ST_IsEmpty(geom)
         )
-        SELECT {poly_layer} AS layer, cls, {area_minzoom} AS minzoom,
-               name, osm_id, geom,
-               ST_XMin(geom), ST_YMin(geom), ST_XMax(geom), ST_YMax(geom)
-        FROM classified
-        WHERE cls IS NOT NULL AND NOT ST_IsEmpty(geom)
+        SELECT *, {cell} AS cell FROM bounded
+        WHERE minzoom <= {MAXZOOM}
+        ORDER BY cell
         "#,
+        cell = cell(),
         to_3857 = TO_3857,
         poly_class = config::POLY_CLASS_SQL,
         poly_layer = config::POLY_LAYER_SQL,
