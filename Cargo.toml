@@ -1,0 +1,11 @@
+# One workspace, two binaries, and the split between them is the point of the
+# project: `minimap` builds the archive and needs DuckDB, GEOS and a PBF parser;
+# `minimap-backend` serves it and needs none of them. Nothing in backend/'s
+# dependency tree can reach a database, which is what keeps the deployed thing a
+# mmap and two binary searches.
+[workspace]
+members = ["pipeline", "backend"]
+resolver = "2"
+
+[profile.release]
+opt-level = 3

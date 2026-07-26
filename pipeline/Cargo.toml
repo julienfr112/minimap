@@ -1,0 +1,41 @@
+[package]
+name = "minimap"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "minimap"
+path = "src/main.rs"
+
+[dependencies]
+# The PBF parser. Blobs are independent zlib streams, which is what makes the
+# extraction step scale across cores.
+osmpbf = "0.3"
+rayon = "1"
+# Everything geometric happens in DuckDB SQL; the spatial extension is loaded at
+# runtime. `bundled` compiles DuckDB itself, so the pipeline is one binary with
+# no system library to install and no version skew with the extension.
+duckdb = { version = "1.10505", features = ["bundled"] }
+# PMTiles writing, via the reference implementation rather than hand-rolled spec
+# code, so the archive is correct by construction. Default features would drag
+# in reqwest, tokio and the AWS SDK to *read* archives over the network, which
+# is emphatically not this crate's problem.
+pmtiles = { version = "0.23", default-features = false, features = ["write"] }
+# For the gzip-9 tile codec in export.rs; already in pmtiles' tree.
+flate2 = "1"
+# Downloading extracts. Geofabrik is HTTPS-only.
+ureq = "3"
+# Only for Geofabrik's region index, which `europe-urls` filters.
+serde_json = "1"
+
+# Not an optimisation, a correction. DuckDB's own Linux builds link jemalloc;
+# the amalgamation `bundled` compiles does not, and the bake is one long storm of
+# small GEOS allocations across 16 threads, which is exactly what glibc malloc is
+# worst at. Measured on Picardie: 79.9s of bake without it, 38.0s with.
+#
+# `unprefixed_malloc_on_supported_platforms` is the part that matters: it makes
+# jemalloc export plain `malloc`/`free`, so DuckDB's C++ is redirected too. The
+# `#[global_allocator]` alone would only cover Rust's own allocations, which are
+# a rounding error here.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { version = "0.7", features = ["unprefixed_malloc_on_supported_platforms"] }

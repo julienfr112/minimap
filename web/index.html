@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>minimap - Hauts-de-France</title>
+  <style>
+    :root { color-scheme: light; }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { height: 100%; overflow: hidden; }
+    body {
+      font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+      background: #f6f4ef;
+    }
+    #map {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+      cursor: grab;
+      touch-action: none; /* let us handle pan/zoom ourselves */
+    }
+    .panel {
+      position: fixed;
+      padding: 6px 10px;
+      background: rgba(255, 255, 255, .85);
+      border: 1px solid rgba(0, 0, 0, .12);
+      border-radius: 6px;
+      backdrop-filter: blur(6px);
+      pointer-events: none;
+      white-space: nowrap;
+    }
+    #hud { top: 10px; left: 10px; }
+    #help { top: 10px; right: 10px; color: #555; }
+    #attribution { bottom: 10px; right: 10px; font-size: 11px; color: #444; }
+    #attribution a { color: inherit; }
+  </style>
+</head>
+<body>
+  <canvas id="map"></canvas>
+  <div class="panel" id="hud">loading…</div>
+  <div class="panel" id="help">drag to pan · scroll to zoom</div>
+  <div class="panel" id="attribution"></div>
+  <script src="/minimap.js"></script>
+</body>
+</html>

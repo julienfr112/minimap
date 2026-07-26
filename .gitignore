@@ -1,0 +1,9 @@
+# Downloaded OSM extracts (31.7 GB of country PBFs) and everything the
+# pipeline generates from them. All of it is rebuildable with `minimap all`.
+data/
+*.duckdb
+*.duckdb.wal
+*.pmtiles
+
+# Rust build output
+target/

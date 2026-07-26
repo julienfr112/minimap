@@ -1,0 +1,15 @@
+[package]
+name = "minimap-backend"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
+# The archive is mmapped rather than read, so tile bytes are never copied into
+# the process and the kernel decides what stays resident. This is what lets a
+# 14 GB archive be served from a 1 GB VPS.
+memmap2 = "0.9"
+# Only used to inflate the directory sections. Tiles are passed through still
+# gzipped, so nothing decompresses them here.
+flate2 = "1"
