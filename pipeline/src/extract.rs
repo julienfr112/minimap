@@ -69,9 +69,9 @@ pub fn run(path: &Path, sink: &mut impl Sink) -> Result<(), Box<dyn std::error::
     let wanted: HashSet<i64> = relations.iter().flat_map(|r| r.members.iter().copied()).collect();
 
     let mut ways = scan_ways(&blobs, &wanted, &words);
-    ways.refs.index.sort_unstable_by_key(|&(id, _, _)| id);
+    ways.refs.index.sort_unstable_by_key(|s| s.way);
 
-    let locations = scan_nodes(&blobs, &ways.refs.nodes);
+    let locations = scan_nodes(&blobs, &ways.refs);
     config::log(format!(
         "  {} ways kept, {} multipolygons, {} node locations",
         config::commas(ways.refs.len() as u64),
@@ -216,22 +216,34 @@ struct Ways {
     refs: WayRefs,
 }
 
-/// Node ids of many ways, CSR-style: one flat `nodes` array plus an `index` of
-/// `(way id, offset, count)` sorted by way id.
+/// Where one way's node ids live.
+#[derive(Clone, Copy)]
+struct Span {
+    way: i64,
+    chunk: u32,
+    start: u32,
+    count: u32,
+}
+
+/// Node ids of many ways: an `index` sorted by way id, over per-worker `chunks`
+/// that hold the ids end to end.
 ///
-/// The obvious `Vec<(i64, Vec<i64>)>` costs a heap allocation per way, and a
-/// dense country has millions of them: Belgium's 10.5M ways paid 24 bytes of
-/// `Vec` header plus a size-class-rounded allocation each, on top of the node
-/// ids themselves. Here the ids live end to end in one buffer and a way is 16
-/// bytes of index.
+/// Two things are deliberate here. A `Vec<(i64, Vec<i64>)>` would cost a heap
+/// allocation per way, and a dense country has millions of them -- Belgium's
+/// 10.5M ways each paid a `Vec` header plus a size-class-rounded allocation on
+/// top of the ids. So ids go end to end and a way costs 24 bytes of index.
 ///
-/// Sorting touches only the index, so node data is never permuted -- which is
-/// also why `offset` can stay a `u32`: it indexes one extract's nodes, and the
-/// largest country extract is two orders of magnitude below `u32::MAX`.
+/// And the chunks are never concatenated into one buffer, which is what makes
+/// merging cheap. Appending one worker's ids to another's means reallocating a
+/// buffer that already holds hundreds of millions of them, so old and new exist
+/// at once: on France that transient alone was 4.2 GB, more than a tenth of the
+/// machine. Moving the buffers instead costs 24 bytes per chunk and there are a
+/// few hundred of them. Sorting likewise touches only the index, so ids are
+/// never permuted either.
 #[derive(Default)]
 struct WayRefs {
-    index: Vec<(i64, u32, u32)>,
-    nodes: Vec<i64>,
+    index: Vec<Span>,
+    chunks: Vec<Vec<i64>>,
 }
 
 impl WayRefs {
@@ -240,10 +252,19 @@ impl WayRefs {
     }
 
     /// The node ids of one way. `None` if this extract does not contain it.
+    ///
+    /// A way's ids are always contiguous within one chunk, because the worker
+    /// that read the way appended them in one go.
     fn get(&self, id: i64) -> Option<&[i64]> {
-        let k = self.index.binary_search_by_key(&id, |&(w, _, _)| w).ok()?;
-        let (_, start, count) = self.index[k];
-        Some(&self.nodes[start as usize..start as usize + count as usize])
+        let k = self.index.binary_search_by_key(&id, |s| s.way).ok()?;
+        let s = self.index[k];
+        let chunk = &self.chunks[s.chunk as usize];
+        Some(&chunk[s.start as usize..s.start as usize + s.count as usize])
+    }
+
+    /// Total ids held, for sizing pass 3's array exactly.
+    fn total(&self) -> usize {
+        self.chunks.iter().map(Vec::len).sum()
     }
 }
 
@@ -278,41 +299,51 @@ fn scan_ways(blobs: &[MmapBlob<'_>], wanted: &HashSet<i64>, words: &Interner) ->
                     // Append first and inspect in place, so a way that turns out
                     // to be undrawable costs no allocation at all -- only a
                     // truncate back to where it started.
-                    let start = out.refs.nodes.len();
-                    out.refs.nodes.extend(way.refs());
-                    let refs = &out.refs.nodes[start..];
+                    if out.refs.chunks.is_empty() {
+                        out.refs.chunks.push(Vec::new());
+                    }
+                    let buf = out.refs.chunks.last_mut().expect("just pushed");
+                    let start = buf.len();
+                    buf.extend(way.refs());
                     // libosmium only builds areas from closed ways, and a ring
                     // needs three corners plus the repeated first node.
+                    let refs = &buf[start..];
                     let is_area = area_key
                         && !area_no
                         && refs.len() >= 4
                         && refs[0] == refs[refs.len() - 1];
 
                     if !is_line && !is_area && !wanted.contains(&id) {
-                        out.refs.nodes.truncate(start);
+                        buf.truncate(start);
                         continue;
                     }
+                    let count = buf.len() - start;
                     if is_line {
                         out.lines.push((id, line_tags(way.tags(), words)));
                     }
                     if is_area {
                         out.areas.push((id, area_tags(way.tags(), words)));
                     }
-                    let count = out.refs.nodes.len() - start;
-                    out.refs.index.push((id, start as u32, count as u32));
+                    let chunk = (out.refs.chunks.len() - 1) as u32;
+                    out.refs.index.push(Span {
+                        way: id,
+                        chunk,
+                        start: start as u32,
+                        count: count as u32,
+                    });
                 }
             }
         },
         |mut a, b| {
-            a.lines.extend(b.lines);
-            a.areas.extend(b.areas);
-            // Each thread's offsets are relative to its own buffer, so they
-            // shift by however much is already in `a`.
-            let base = a.refs.nodes.len() as u32;
-            a.refs.index.reserve_exact(b.refs.index.len());
-            a.refs.index.extend(b.refs.index.iter().map(|&(id, s, n)| (id, s + base, n)));
-            a.refs.nodes.reserve_exact(b.refs.nodes.len());
-            a.refs.nodes.extend(b.refs.nodes);
+            let Ways { lines, areas, refs } = b;
+            a.lines.extend(lines);
+            a.areas.extend(areas);
+            // `b`'s spans name `b`'s chunks, which are about to sit after
+            // `a`'s, so only the chunk number shifts. The ids themselves do
+            // not move: that is the point of holding them in chunks.
+            let base = a.refs.chunks.len() as u32;
+            a.refs.index.extend(refs.index.into_iter().map(|s| Span { chunk: s.chunk + base, ..s }));
+            a.refs.chunks.extend(refs.chunks);
             a
         },
     )
@@ -340,13 +371,18 @@ fn unpack(v: u64) -> Pt {
 }
 
 /// Pass 3: coordinates, for the nodes pass 2 asked about and no others.
-///
-/// `wanted` is pass 2's flat node array, so this is a copy-sort-dedup of it
-/// rather than a gather across millions of separate ways.
-fn scan_nodes(blobs: &[MmapBlob<'_>], wanted: &[i64]) -> Locations {
-    let mut ids: Vec<i64> = wanted.to_vec();
+fn scan_nodes(blobs: &[MmapBlob<'_>], wanted: &WayRefs) -> Locations {
+    // Sized exactly, then handed the slack back: on France the flat ref list is
+    // ~700M ids and dedup leaves ~479M, so the unshrunk capacity would hold
+    // 1.8 GB that nothing ever reads. Shrinking costs a copy at a point where
+    // `packed` is not allocated yet, so it does not raise the peak.
+    let mut ids: Vec<i64> = Vec::with_capacity(wanted.total());
+    for chunk in &wanted.chunks {
+        ids.extend_from_slice(chunk);
+    }
     ids.sort_unstable();
     ids.dedup();
+    ids.shrink_to_fit();
 
     // One slot per wanted node, written by whichever worker happens to decode
     // the block that node lives in. The slots are disjoint, so the ordering is
