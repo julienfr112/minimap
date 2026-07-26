@@ -100,8 +100,20 @@ pub fn run(con: &Connection, regions: &[String]) -> Result<(), Box<dyn std::erro
             SELECT osm_id, name, building, landuse, "natural", water, waterway,
                    leisure, {to_3857} AS geom
             FROM raw WHERE kind = 'area'
+        ), valid AS (
+            -- OSM rings self-intersect often enough that this is not an edge
+            -- case: Luxembourg has two woods that GEOS refuses to clip, and it
+            -- refuses by throwing, which fails the whole bake. Repairing here
+            -- costs one pass at load; repairing in the bake would cost one per
+            -- zoom per layer. MakeValid can demote a polygon to a collection of
+            -- lines and points, so keep only the polygonal part -- and if that
+            -- leaves nothing, the ST_IsEmpty filter below drops the feature.
+            SELECT * REPLACE (
+                CASE WHEN ST_IsValid(geom) THEN geom
+                     ELSE ST_CollectionExtract(ST_MakeValid(geom), 3) END AS geom
+            ) FROM src
         ), classified AS (
-            SELECT osm_id, name, geom, {poly_class} AS cls FROM src
+            SELECT osm_id, name, geom, {poly_class} AS cls FROM valid
         )
         SELECT {poly_layer} AS layer, cls, {area_minzoom} AS minzoom,
                name, osm_id, geom,
