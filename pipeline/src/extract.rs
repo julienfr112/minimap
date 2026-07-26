@@ -40,7 +40,7 @@ use rayon::prelude::*;
 
 use crate::config::{self, MIN_SPAN};
 use crate::geom::{self, Pt, Ring};
-use crate::rows::{Row, Sink, Tags, BATCH};
+use crate::rows::{Interner, Row, Sink, TagSet, Tags, BATCH};
 
 /// Waterways worth drawing as a line. Everything else tagged `waterway` is
 /// either an area or too small to matter.
@@ -62,13 +62,16 @@ pub fn run(path: &Path, sink: &mut impl Sink) -> Result<(), Box<dyn std::error::
     let mmap = unsafe { Mmap::from_path(path)? };
     let blobs: Vec<MmapBlob<'_>> = mmap.blob_iter().collect::<osmpbf::Result<_>>()?;
 
-    let relations = scan_relations(&blobs);
+    // One vocabulary for the whole extract, shared by both scanning passes.
+    let words = Interner::default();
+
+    let relations = scan_relations(&blobs, &words);
     let wanted: HashSet<i64> = relations.iter().flat_map(|r| r.members.iter().copied()).collect();
 
-    let mut ways = scan_ways(&blobs, &wanted);
-    ways.refs.sort_unstable_by_key(|(id, _)| *id);
+    let mut ways = scan_ways(&blobs, &wanted, &words);
+    ways.refs.index.sort_unstable_by_key(|&(id, _, _)| id);
 
-    let locations = scan_nodes(&blobs, &ways.refs);
+    let locations = scan_nodes(&blobs, &ways.refs.nodes);
     config::log(format!(
         "  {} ways kept, {} multipolygons, {} node locations",
         config::commas(ways.refs.len() as u64),
@@ -78,33 +81,32 @@ pub fn run(path: &Path, sink: &mut impl Sink) -> Result<(), Box<dyn std::error::
 
     let (mut n_lines, mut n_way_areas, mut n_rel_areas) = (0, 0, 0);
 
-    for chunk in ways.lines.chunks_mut(BATCH) {
+    for chunk in ways.lines.chunks(BATCH) {
         let batch: Vec<Row> = chunk
-            .par_iter_mut()
-            .filter_map(|(id, tags)| build_line(*id, std::mem::take(tags), &ways.refs, &locations))
+            .par_iter()
+            .filter_map(|(id, tags)| build_line(*id, tags.resolve(&words), &ways.refs, &locations))
             .collect();
         n_lines += batch.len();
         sink.write("line", &batch)?;
     }
-    for chunk in ways.areas.chunks_mut(BATCH) {
+    for chunk in ways.areas.chunks(BATCH) {
         let batch: Vec<Row> = chunk
-            .par_iter_mut()
+            .par_iter()
             .filter_map(|(id, tags)| {
                 // A lone closed way has no second ring to share a wall with, so
                 // it goes straight to a ring without the assembly step.
-                let ring = resolve(way_refs(&ways.refs, *id)?, &locations)?;
+                let ring = resolve(ways.refs.get(*id)?, &locations)?;
                 // Area ids follow libosmium's convention so the two sources
                 // cannot collide: a way-area is 2*id, a relation-area 2*id+1.
-                build_area(2 * *id, std::mem::take(tags), vec![ring], min_span)
+                build_area(2 * *id, tags.resolve(&words), vec![ring], min_span)
             })
             .collect();
         n_way_areas += batch.len();
         sink.write("area", &batch)?;
     }
-    let mut relations = relations;
-    for chunk in relations.chunks_mut(BATCH) {
+    for chunk in relations.chunks(BATCH) {
         let batch: Vec<Row> = chunk
-            .par_iter_mut()
+            .par_iter()
             .filter_map(|rel| {
                 // A member way missing from the file, or a node missing under
                 // one, means the relation is cut by the extract boundary. Half
@@ -112,11 +114,10 @@ pub fn run(path: &Path, sink: &mut impl Sink) -> Result<(), Box<dyn std::error::
                 let parts: Vec<Vec<u64>> = rel
                     .members
                     .iter()
-                    .map(|w| resolve(way_refs(&ways.refs, *w)?, &locations))
+                    .map(|w| resolve(ways.refs.get(*w)?, &locations))
                     .collect::<Option<_>>()?;
                 let rings = geom::assemble_rings(parts)?;
-                let tags = std::mem::take(&mut rel.tags);
-                build_area(2 * rel.id + 1, tags, rings, min_span)
+                build_area(2 * rel.id + 1, rel.tags.resolve(&words), rings, min_span)
             })
             .collect();
         n_rel_areas += batch.len();
@@ -158,12 +159,12 @@ fn scan<T: Send>(
 
 struct RelArea {
     id: i64,
-    tags: Tags,
+    tags: TagSet,
     members: Vec<i64>,
 }
 
 /// Pass 1: multipolygon and boundary relations carrying a tag we draw.
-fn scan_relations(blobs: &[MmapBlob<'_>]) -> Vec<RelArea> {
+fn scan_relations(blobs: &[MmapBlob<'_>], words: &Interner) -> Vec<RelArea> {
     scan(
         blobs,
         Vec::new,
@@ -196,7 +197,7 @@ fn scan_relations(blobs: &[MmapBlob<'_>]) -> Vec<RelArea> {
                     if nested || members.is_empty() {
                         continue;
                     }
-                    out.push(RelArea { id: rel.id(), tags: area_tags(rel.tags()), members });
+                    out.push(RelArea { id: rel.id(), tags: area_tags(rel.tags(), words), members });
                 }
             }
         },
@@ -209,14 +210,45 @@ fn scan_relations(blobs: &[MmapBlob<'_>]) -> Vec<RelArea> {
 
 #[derive(Default)]
 struct Ways {
-    lines: Vec<(i64, Tags)>,
-    areas: Vec<(i64, Tags)>,
-    /// Node ids of every way the two lists above need, sorted by way id.
-    refs: Vec<(i64, Vec<i64>)>,
+    lines: Vec<(i64, TagSet)>,
+    areas: Vec<(i64, TagSet)>,
+    /// Node ids of every way the two lists above need.
+    refs: WayRefs,
+}
+
+/// Node ids of many ways, CSR-style: one flat `nodes` array plus an `index` of
+/// `(way id, offset, count)` sorted by way id.
+///
+/// The obvious `Vec<(i64, Vec<i64>)>` costs a heap allocation per way, and a
+/// dense country has millions of them: Belgium's 10.5M ways paid 24 bytes of
+/// `Vec` header plus a size-class-rounded allocation each, on top of the node
+/// ids themselves. Here the ids live end to end in one buffer and a way is 16
+/// bytes of index.
+///
+/// Sorting touches only the index, so node data is never permuted -- which is
+/// also why `offset` can stay a `u32`: it indexes one extract's nodes, and the
+/// largest country extract is two orders of magnitude below `u32::MAX`.
+#[derive(Default)]
+struct WayRefs {
+    index: Vec<(i64, u32, u32)>,
+    nodes: Vec<i64>,
+}
+
+impl WayRefs {
+    fn len(&self) -> usize {
+        self.index.len()
+    }
+
+    /// The node ids of one way. `None` if this extract does not contain it.
+    fn get(&self, id: i64) -> Option<&[i64]> {
+        let k = self.index.binary_search_by_key(&id, |&(w, _, _)| w).ok()?;
+        let (_, start, count) = self.index[k];
+        Some(&self.nodes[start as usize..start as usize + count as usize])
+    }
 }
 
 /// Pass 2: the ways we draw, plus the ways the wanted relations are built from.
-fn scan_ways(blobs: &[MmapBlob<'_>], wanted: &HashSet<i64>) -> Ways {
+fn scan_ways(blobs: &[MmapBlob<'_>], wanted: &HashSet<i64>, words: &Interner) -> Ways {
     scan(
         blobs,
         Ways::default,
@@ -243,7 +275,12 @@ fn scan_ways(blobs: &[MmapBlob<'_>], wanted: &HashSet<i64>) -> Ways {
                     let is_line =
                         highway.is_some() || waterway.is_some_and(|w| WATERWAY_LINES.contains(&w));
 
-                    let refs: Vec<i64> = way.refs().collect();
+                    // Append first and inspect in place, so a way that turns out
+                    // to be undrawable costs no allocation at all -- only a
+                    // truncate back to where it started.
+                    let start = out.refs.nodes.len();
+                    out.refs.nodes.extend(way.refs());
+                    let refs = &out.refs.nodes[start..];
                     // libosmium only builds areas from closed ways, and a ring
                     // needs three corners plus the repeated first node.
                     let is_area = area_key
@@ -252,22 +289,30 @@ fn scan_ways(blobs: &[MmapBlob<'_>], wanted: &HashSet<i64>) -> Ways {
                         && refs[0] == refs[refs.len() - 1];
 
                     if !is_line && !is_area && !wanted.contains(&id) {
+                        out.refs.nodes.truncate(start);
                         continue;
                     }
                     if is_line {
-                        out.lines.push((id, line_tags(way.tags())));
+                        out.lines.push((id, line_tags(way.tags(), words)));
                     }
                     if is_area {
-                        out.areas.push((id, area_tags(way.tags())));
+                        out.areas.push((id, area_tags(way.tags(), words)));
                     }
-                    out.refs.push((id, refs));
+                    let count = out.refs.nodes.len() - start;
+                    out.refs.index.push((id, start as u32, count as u32));
                 }
             }
         },
         |mut a, b| {
             a.lines.extend(b.lines);
             a.areas.extend(b.areas);
-            a.refs.extend(b.refs);
+            // Each thread's offsets are relative to its own buffer, so they
+            // shift by however much is already in `a`.
+            let base = a.refs.nodes.len() as u32;
+            a.refs.index.reserve_exact(b.refs.index.len());
+            a.refs.index.extend(b.refs.index.iter().map(|&(id, s, n)| (id, s + base, n)));
+            a.refs.nodes.reserve_exact(b.refs.nodes.len());
+            a.refs.nodes.extend(b.refs.nodes);
             a
         },
     )
@@ -295,8 +340,11 @@ fn unpack(v: u64) -> Pt {
 }
 
 /// Pass 3: coordinates, for the nodes pass 2 asked about and no others.
-fn scan_nodes(blobs: &[MmapBlob<'_>], ways: &[(i64, Vec<i64>)]) -> Locations {
-    let mut ids: Vec<i64> = ways.iter().flat_map(|(_, r)| r.iter().copied()).collect();
+///
+/// `wanted` is pass 2's flat node array, so this is a copy-sort-dedup of it
+/// rather than a gather across millions of separate ways.
+fn scan_nodes(blobs: &[MmapBlob<'_>], wanted: &[i64]) -> Locations {
+    let mut ids: Vec<i64> = wanted.to_vec();
     ids.sort_unstable();
     ids.dedup();
 
@@ -328,39 +376,34 @@ fn scan_nodes(blobs: &[MmapBlob<'_>], ways: &[(i64, Vec<i64>)]) -> Locations {
 
 // --- row construction -----------------------------------------------------
 
-fn line_tags<'a>(tags: impl Iterator<Item = (&'a str, &'a str)>) -> Tags {
-    let mut t = Tags::default();
+fn line_tags<'a>(tags: impl Iterator<Item = (&'a str, &'a str)>, words: &Interner) -> TagSet {
+    let mut t = TagSet::default();
     for (k, v) in tags {
         match k {
-            "name" => t.name = Some(v.to_string()),
-            "highway" => t.highway = Some(v.to_string()),
-            "waterway" => t.waterway = Some(v.to_string()),
+            "name" => t.name = words.intern(v),
+            "highway" => t.highway = words.intern(v),
+            "waterway" => t.waterway = words.intern(v),
             _ => {}
         }
     }
     t
 }
 
-fn area_tags<'a>(tags: impl Iterator<Item = (&'a str, &'a str)>) -> Tags {
-    let mut t = Tags::default();
+fn area_tags<'a>(tags: impl Iterator<Item = (&'a str, &'a str)>, words: &Interner) -> TagSet {
+    let mut t = TagSet::default();
     for (k, v) in tags {
         match k {
-            "name" => t.name = Some(v.to_string()),
-            "waterway" => t.waterway = Some(v.to_string()),
-            "building" => t.building = Some(v.to_string()),
-            "landuse" => t.landuse = Some(v.to_string()),
-            "natural" => t.natural = Some(v.to_string()),
-            "leisure" => t.leisure = Some(v.to_string()),
-            "water" => t.water = Some(v.to_string()),
+            "name" => t.name = words.intern(v),
+            "waterway" => t.waterway = words.intern(v),
+            "building" => t.building = words.intern(v),
+            "landuse" => t.landuse = words.intern(v),
+            "natural" => t.natural = words.intern(v),
+            "leisure" => t.leisure = words.intern(v),
+            "water" => t.water = words.intern(v),
             _ => {}
         }
     }
     t
-}
-
-fn way_refs(ways: &[(i64, Vec<i64>)], id: i64) -> Option<&[i64]> {
-    let k = ways.binary_search_by_key(&id, |(w, _)| *w).ok()?;
-    Some(&ways[k].1)
 }
 
 /// Node ids to packed positions, dropping the repeats a duplicated node makes.
@@ -380,8 +423,8 @@ fn resolve(ids: &[i64], locations: &Locations) -> Option<Vec<u64>> {
     Some(out)
 }
 
-fn build_line(id: i64, tags: Tags, ways: &[(i64, Vec<i64>)], locations: &Locations) -> Option<Row> {
-    let pts: Vec<Pt> = resolve(way_refs(ways, id)?, locations)?.into_iter().map(unpack).collect();
+fn build_line(id: i64, tags: Tags, ways: &WayRefs, locations: &Locations) -> Option<Row> {
+    let pts: Vec<Pt> = resolve(ways.get(id)?, locations)?.into_iter().map(unpack).collect();
     if pts.len() < 2 {
         return None;
     }
