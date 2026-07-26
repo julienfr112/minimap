@@ -53,15 +53,26 @@ pub const DEFAULT_REGIONS: [&str; 1] = ["picardie"];
 
 /// Where a region's extract lives.
 ///
-/// Regions named in SOURCES are downloaded flat into data/. Everything else is
-/// looked up among the country extracts fetched by ./fetch-europe.sh, which
-/// keeps Geofabrik's own `-latest` naming.
+/// `download` puts SOURCES regions flat into data/; ./fetch-europe.sh puts
+/// country extracts in data/countries/ under Geofabrik's own `-latest` naming.
+/// A region can be reachable by either route -- `france` and `europe` are in
+/// SOURCES *and* fetched by the script -- so look for the file that is actually
+/// there before deciding which layout this region uses.
 pub fn pbf_path(region: &str) -> PathBuf {
     let flat = data().join(format!("{region}.osm.pbf"));
-    if flat.exists() || SOURCES.iter().any(|(n, _)| *n == region) {
+    if flat.exists() {
         return flat;
     }
-    countries().join(format!("{region}-latest.osm.pbf"))
+    let country = countries().join(format!("{region}-latest.osm.pbf"));
+    if country.exists() {
+        return country;
+    }
+    // Neither is downloaded yet, so name where `download` would put it.
+    if SOURCES.iter().any(|(n, _)| *n == region) {
+        flat
+    } else {
+        country
+    }
 }
 
 /// Everything loadable right now: known sources plus downloaded countries.

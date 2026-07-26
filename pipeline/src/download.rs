@@ -50,22 +50,26 @@ pub fn europe_urls() -> Result<(), Box<dyn std::error::Error>> {
 pub fn run(regions: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(config::data())?;
     for region in regions {
-        let Some((_, url)) = config::SOURCES.iter().find(|(n, _)| n == region) else {
-            // Country extracts arrive via fetch-europe.sh; nothing to do here.
-            config::log(format!("{region}: not a downloadable source, skipping"));
-            continue;
-        };
-        let dest = config::data().join(format!("{region}.osm.pbf"));
+        // Ask where the extract would be *read* from, not where this step would
+        // write it: `france` and `europe` are in SOURCES and also fetched by
+        // ./fetch-europe.sh, and checking only the flat path re-downloaded 5 GB
+        // of France that was already sitting in data/countries/.
+        let dest = config::pbf_path(region);
         if let Ok(meta) = std::fs::metadata(&dest) {
             if meta.len() > 1_000_000 {
                 config::log(format!(
                     "{} already present ({:.0} MB)",
-                    dest.file_name().unwrap().to_string_lossy(),
+                    dest.file_name().unwrap_or(dest.as_os_str()).to_string_lossy(),
                     meta.len() as f64 / 1e6
                 ));
                 continue;
             }
         }
+        let Some((_, url)) = config::SOURCES.iter().find(|(n, _)| n == region) else {
+            // Country extracts arrive via fetch-europe.sh; nothing to do here.
+            config::log(format!("{region}: not a downloadable source, skipping"));
+            continue;
+        };
 
         let t0 = Instant::now();
         config::log(format!("downloading {region} ..."));
@@ -81,6 +85,10 @@ pub fn run(regions: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let mut file = std::fs::File::create(&dest)?;
         let mut buf = vec![0u8; 1 << 20];
         let mut done = 0u64;
+        // Reprinting per 1 MB chunk is fine on a terminal, where `\r` overwrites
+        // the line, and 25 MB of log when stdout is a file. Once per percent is
+        // enough either way.
+        let mut shown = u64::MAX;
         loop {
             let n = reader.read(&mut buf)?;
             if n == 0 {
@@ -88,7 +96,8 @@ pub fn run(regions: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
             file.write_all(&buf[..n])?;
             done += n as u64;
-            if total > 0 {
+            if total > 0 && done * 100 / total != shown {
+                shown = done * 100 / total;
                 print!("\r    {:6.0} / {:.0} MB", done as f64 / 1e6, total as f64 / 1e6);
                 std::io::stdout().flush()?;
             }
