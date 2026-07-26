@@ -203,7 +203,12 @@ class Minimap {
     this.ctx = canvas.getContext('2d');
     this.meta = meta;
     this.minzoom = meta.minzoom;
-    this.maxzoom = meta.maxzoom;
+    // `?maxzoom=N` pretends the archive stops at N, overzooming from there.
+    // Worth having because the deepest zoom is most of the archive -- z15 is
+    // 44% of France -- so this answers "what would I lose by not baking it"
+    // without rebuilding anything.
+    const cap = +new URLSearchParams(location.search).get('maxzoom');
+    this.maxzoom = cap ? Math.min(meta.maxzoom, cap) : meta.maxzoom;
     this.zoom = meta.center[2];
     this.center = { lon: meta.center[0], lat: meta.center[1] };
 
