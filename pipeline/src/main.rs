@@ -120,6 +120,30 @@ fn connect(read_only: bool) -> Result<Connection, Box<dyn std::error::Error>> {
         Connection::open(&path)?
     };
     con.execute_batch("INSTALL spatial; LOAD spatial; SET preserve_insertion_order = false;")?;
+
+    // DuckDB's own default is 80% of system RAM, which is the wrong budget here:
+    // this process is also the extractor, and at France/z15 the two together
+    // reached 33 GB on a 36 GB machine and were OOM-killed midway through
+    // classifying areas. Half the machine leaves room for that, and a bounded
+    // DuckDB spills to disk rather than growing -- which is the behaviour we
+    // want, since disk is the resource we have most of.
+    // DuckDB wants an absolute size (it rejects '50%'), so read the machine's
+    // and halve it. Anywhere without /proc, keep DuckDB's own default.
+    let limit = std::env::var("MINIMAP_MEMORY_LIMIT").ok().or_else(|| {
+        let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let kb: u64 = meminfo
+            .lines()
+            .find(|l| l.starts_with("MemTotal:"))?
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()?;
+        Some(format!("{}MiB", kb / 1024 / 2))
+    });
+    if let Some(limit) = limit {
+        con.execute_batch(&format!("SET memory_limit = '{limit}'"))?;
+        config::log(format!("duckdb memory_limit {limit}"));
+    }
     Ok(con)
 }
 
