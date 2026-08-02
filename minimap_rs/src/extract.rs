@@ -38,7 +38,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use osmpbf::{BlobDecode, Mmap, MmapBlob, PrimitiveBlock};
 use rayon::prelude::*;
 
-use crate::config::{self, MIN_SPAN};
+use crate::progress;
 use crate::geom::{self, Pt, Ring};
 use crate::rows::{Interner, Row, Sink, TagSet, Tags, BATCH};
 
@@ -47,15 +47,99 @@ use crate::rows::{Interner, Row, Sink, TagSet, Tags, BATCH};
 const WATERWAY_LINES: [&str; 5] = ["river", "canal", "stream", "ditch", "drain"];
 
 /// A closed way with any of these is a candidate area.
-const AREA_KEYS: [&str; 6] = ["building", "landuse", "natural", "leisure", "water", "waterway"];
+const AREA_KEYS: [&str; 6] = [
+    "building", "landuse", "natural", "leisure", "water", "waterway",
+];
 
 /// No coordinate stored for this node yet. A real node at exactly
 /// (-1e-7, -1e-7) would be indistinguishable; it is 11 metres off Null Island
 /// and it does not exist.
 const MISSING: u64 = u64::MAX;
 
-pub fn run(path: &Path, sink: &mut impl Sink) -> Result<(), Box<dyn std::error::Error>> {
-    let min_span = MIN_SPAN;
+/// A named settlement, for labels.
+#[derive(Clone)]
+pub struct Place {
+    pub name: String,
+    pub kind: String,
+    pub population: i64,
+    pub lon: f64,
+    pub lat: f64,
+}
+
+/// Settlements worth a label. `city` and `town` only: `village` and below would
+/// multiply the count by an order of magnitude to write names nobody reads at
+/// the zooms this map offers.
+const PLACE_KINDS: [&str; 2] = ["city", "town"];
+
+/// Pass 4, and the only one that treats a node as a feature in its own right.
+///
+/// Kept out of the way/area machinery entirely rather than threaded through
+/// `TagSet` as two more columns. That structure is the extractor's largest --
+/// one per candidate object, and Belgium alone has 10.5M of them -- so widening
+/// it to carry tags that only nodes use would cost every way in Europe to serve
+/// a few tens of thousands of cities. This walks the same mmapped blobs and
+/// returns a Vec small enough to hand around whole.
+pub fn scan_places(path: &Path) -> Result<Vec<Place>, Box<dyn std::error::Error>> {
+    let mmap = unsafe { Mmap::from_path(path)? };
+    let blobs: Vec<MmapBlob<'_>> = mmap.blob_iter().collect::<osmpbf::Result<_>>()?;
+    let places: Vec<Place> = blobs
+        .par_iter()
+        .filter_map(|blob| blob.decode().ok())
+        .flat_map_iter(|block| {
+            let mut out = Vec::new();
+            if let osmpbf::BlobDecode::OsmData(block) = block {
+                for node in block.groups().flat_map(|g| g.nodes()) {
+                    collect_place(node.tags(), node.lon(), node.lat(), &mut out);
+                }
+                for node in block.groups().flat_map(|g| g.dense_nodes()) {
+                    collect_place(node.tags(), node.lon(), node.lat(), &mut out);
+                }
+            }
+            out
+        })
+        .collect();
+    Ok(places)
+}
+
+fn collect_place<'a>(
+    tags: impl Iterator<Item = (&'a str, &'a str)>,
+    lon: f64,
+    lat: f64,
+    out: &mut Vec<Place>,
+) {
+    let (mut name, mut kind, mut population) = (None, None, 0i64);
+    for (k, v) in tags {
+        match k {
+            "name" => name = Some(v.to_string()),
+            "place" if PLACE_KINDS.contains(&v) => kind = Some(v.to_string()),
+            // Freeform in practice: "1 234 567", "approx 40000", "40,000".
+            // Keep the digits and give up on the rest rather than drop a city
+            // for spelling its size oddly.
+            "population" => {
+                let digits: String = v.chars().filter(char::is_ascii_digit).collect();
+                population = digits.parse().unwrap_or(0);
+            }
+            _ => {}
+        }
+    }
+    if let (Some(name), Some(kind)) = (name, kind) {
+        out.push(Place {
+            name,
+            kind,
+            population,
+            lon,
+            lat,
+        });
+    }
+}
+
+pub fn run(
+    path: &Path,
+    sink: &mut impl Sink,
+    min_span: f64,
+    label: &str,
+    weight: f64,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Mapping the file gives every worker a cheap view of it; the blob list is
     // just offsets and lengths into that map, so the three passes below re-read
     // the file without re-scanning its framing.
@@ -65,22 +149,33 @@ pub fn run(path: &Path, sink: &mut impl Sink) -> Result<(), Box<dyn std::error::
     // One vocabulary for the whole extract, shared by both scanning passes.
     let words = Interner::default();
 
-    let relations = scan_relations(&blobs, &words);
-    let wanted: HashSet<i64> = relations.iter().flat_map(|r| r.members.iter().copied()).collect();
+    // How the region's weight divides across the six phases below. Roughly
+    // measured rather than derived: the three decode passes dominate, and the
+    // node pass is the one that also has a sort in it.
+    let (w_rel, w_way, w_node) = (weight * 0.15, weight * 0.30, weight * 0.30);
+    let (w_lines, w_areas, w_multi) = (weight * 0.05, weight * 0.15, weight * 0.05);
 
-    let mut ways = scan_ways(&blobs, &wanted, &words);
+    let relations = scan_relations(&blobs, &words, &format!("{label} pass 1/3 relations"), w_rel);
+    let wanted: HashSet<i64> = relations
+        .iter()
+        .flat_map(|r| r.members.iter().copied())
+        .collect();
+
+    let mut ways = scan_ways(&blobs, &wanted, &words, &format!("{label} pass 2/3 ways"), w_way);
     ways.refs.index.sort_unstable_by_key(|s| s.way);
 
-    let locations = scan_nodes(&blobs, &ways.refs);
-    config::log(format!(
+    let locations = scan_nodes(&blobs, &ways.refs, &format!("{label} pass 3/3 nodes"), w_node);
+    progress::line(format!(
         "  {} ways kept, {} multipolygons, {} node locations",
-        config::commas(ways.refs.len() as u64),
-        config::commas(relations.len() as u64),
-        config::commas(locations.ids.len() as u64),
+        progress::commas(ways.refs.len() as u64),
+        progress::commas(relations.len() as u64),
+        progress::commas(locations.ids.len() as u64),
     ));
 
     let (mut n_lines, mut n_way_areas, mut n_rel_areas) = (0, 0, 0);
 
+    progress::at(format!("{label} building lines"));
+    let n_line_chunks = ways.lines.chunks(BATCH).count().max(1);
     for chunk in ways.lines.chunks(BATCH) {
         let batch: Vec<Row> = chunk
             .par_iter()
@@ -88,8 +183,11 @@ pub fn run(path: &Path, sink: &mut impl Sink) -> Result<(), Box<dyn std::error::
             .collect();
         n_lines += batch.len();
         sink.write("line", &batch)?;
+        progress::tick(w_lines / n_line_chunks as f64);
     }
-    for chunk in ways.areas.chunks(BATCH) {
+    let n_area_chunks = ways.areas.chunks(BATCH).count().max(1);
+    for (c, chunk) in ways.areas.chunks(BATCH).enumerate() {
+        progress::at(format!("{label} building areas {}/{n_area_chunks}", c + 1));
         let batch: Vec<Row> = chunk
             .par_iter()
             .filter_map(|(id, tags)| {
@@ -103,7 +201,10 @@ pub fn run(path: &Path, sink: &mut impl Sink) -> Result<(), Box<dyn std::error::
             .collect();
         n_way_areas += batch.len();
         sink.write("area", &batch)?;
+        progress::tick(w_areas / n_area_chunks as f64);
     }
+    progress::at(format!("{label} assembling multipolygons"));
+    let n_rel_chunks = relations.chunks(BATCH).count().max(1);
     for chunk in relations.chunks(BATCH) {
         let batch: Vec<Row> = chunk
             .par_iter()
@@ -122,14 +223,15 @@ pub fn run(path: &Path, sink: &mut impl Sink) -> Result<(), Box<dyn std::error::
             .collect();
         n_rel_areas += batch.len();
         sink.write("area", &batch)?;
+        progress::tick(w_multi / n_rel_chunks as f64);
     }
 
-    config::log(format!(
+    progress::line(format!(
         "  {} lines, {} areas ({} ways + {} relations)",
-        config::commas(n_lines as u64),
-        config::commas((n_way_areas + n_rel_areas) as u64),
-        config::commas(n_way_areas as u64),
-        config::commas(n_rel_areas as u64),
+        progress::commas(n_lines as u64),
+        progress::commas((n_way_areas + n_rel_areas) as u64),
+        progress::commas(n_way_areas as u64),
+        progress::commas(n_rel_areas as u64),
     ));
     Ok(())
 }
@@ -142,15 +244,31 @@ pub fn run(path: &Path, sink: &mut impl Sink) -> Result<(), Box<dyn std::error::
 /// parallelising: decompression is the cost of a pass, and it divides cleanly.
 fn scan<T: Send>(
     blobs: &[MmapBlob<'_>],
+    pass: &str,
+    weight: f64,
     empty: impl Fn() -> T + Sync + Send,
     visit: impl Fn(&PrimitiveBlock, &mut T) + Sync + Send,
     merge: impl Fn(T, T) -> T + Sync + Send,
 ) -> T {
+    // Blobs are the only unit of this that is countable before it happens, and
+    // there are thousands of them per extract, so they are what the bar moves
+    // on. Without this a pass over France is four silent minutes.
+    let seen = std::sync::atomic::AtomicUsize::new(0);
+    let n = blobs.len().max(1);
+    let each = weight / n as f64;
     blobs
         .par_iter()
         .fold(&empty, |mut acc, blob| {
             if let BlobDecode::OsmData(block) = blob.decode().expect("corrupt PBF blob") {
                 visit(&block, &mut acc);
+            }
+            let i = seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            // Every blob ticks the weight, but only every 64th rewrites the
+            // label: formatting a string per blob would cost more than the
+            // decode on the small ones.
+            progress::tick(each);
+            if i.is_multiple_of(64) || i == n {
+                progress::at(format!("{pass} {i}/{n}"));
             }
             acc
         })
@@ -164,9 +282,11 @@ struct RelArea {
 }
 
 /// Pass 1: multipolygon and boundary relations carrying a tag we draw.
-fn scan_relations(blobs: &[MmapBlob<'_>], words: &Interner) -> Vec<RelArea> {
+fn scan_relations(blobs: &[MmapBlob<'_>], words: &Interner, pass: &str, weight: f64) -> Vec<RelArea> {
     scan(
         blobs,
+        pass,
+        weight,
         Vec::new,
         |block, out: &mut Vec<RelArea>| {
             for group in block.groups() {
@@ -197,7 +317,11 @@ fn scan_relations(blobs: &[MmapBlob<'_>], words: &Interner) -> Vec<RelArea> {
                     if nested || members.is_empty() {
                         continue;
                     }
-                    out.push(RelArea { id: rel.id(), tags: area_tags(rel.tags(), words), members });
+                    out.push(RelArea {
+                        id: rel.id(),
+                        tags: area_tags(rel.tags(), words),
+                        members,
+                    });
                 }
             }
         },
@@ -269,9 +393,11 @@ impl WayRefs {
 }
 
 /// Pass 2: the ways we draw, plus the ways the wanted relations are built from.
-fn scan_ways(blobs: &[MmapBlob<'_>], wanted: &HashSet<i64>, words: &Interner) -> Ways {
+fn scan_ways(blobs: &[MmapBlob<'_>], wanted: &HashSet<i64>, words: &Interner, pass: &str, weight: f64) -> Ways {
     scan(
         blobs,
+        pass,
+        weight,
         Ways::default,
         |block, out: &mut Ways| {
             for group in block.groups() {
@@ -308,10 +434,8 @@ fn scan_ways(blobs: &[MmapBlob<'_>], wanted: &HashSet<i64>, words: &Interner) ->
                     // libosmium only builds areas from closed ways, and a ring
                     // needs three corners plus the repeated first node.
                     let refs = &buf[start..];
-                    let is_area = area_key
-                        && !area_no
-                        && refs.len() >= 4
-                        && refs[0] == refs[refs.len() - 1];
+                    let is_area =
+                        area_key && !area_no && refs.len() >= 4 && refs[0] == refs[refs.len() - 1];
 
                     if !is_line && !is_area && !wanted.contains(&id) {
                         buf.truncate(start);
@@ -342,7 +466,10 @@ fn scan_ways(blobs: &[MmapBlob<'_>], wanted: &HashSet<i64>, words: &Interner) ->
             // `a`'s, so only the chunk number shifts. The ids themselves do
             // not move: that is the point of holding them in chunks.
             let base = a.refs.chunks.len() as u32;
-            a.refs.index.extend(refs.index.into_iter().map(|s| Span { chunk: s.chunk + base, ..s }));
+            a.refs.index.extend(refs.index.into_iter().map(|s| Span {
+                chunk: s.chunk + base,
+                ..s
+            }));
             a.refs.chunks.extend(refs.chunks);
             a
         },
@@ -371,7 +498,7 @@ fn unpack(v: u64) -> Pt {
 }
 
 /// Pass 3: coordinates, for the nodes pass 2 asked about and no others.
-fn scan_nodes(blobs: &[MmapBlob<'_>], wanted: &WayRefs) -> Locations {
+fn scan_nodes(blobs: &[MmapBlob<'_>], wanted: &WayRefs, pass: &str, weight: f64) -> Locations {
     // Sized exactly, then handed the slack back: on France the flat ref list is
     // ~700M ids and dedup leaves ~479M, so the unshrunk capacity would hold
     // 1.8 GB that nothing ever reads. Shrinking costs a copy at a point where
@@ -394,6 +521,9 @@ fn scan_nodes(blobs: &[MmapBlob<'_>], wanted: &WayRefs) -> Locations {
             packed[k].store(v, Ordering::Relaxed);
         }
     };
+    let seen = std::sync::atomic::AtomicUsize::new(0);
+    let n_blobs = blobs.len().max(1);
+    let each = weight / n_blobs as f64;
     blobs.par_iter().for_each(|blob| {
         if let BlobDecode::OsmData(block) = blob.decode().expect("corrupt PBF blob") {
             for group in block.groups() {
@@ -405,9 +535,17 @@ fn scan_nodes(blobs: &[MmapBlob<'_>], wanted: &WayRefs) -> Locations {
                 }
             }
         }
+        let i = seen.fetch_add(1, Ordering::Relaxed) + 1;
+        progress::tick(each);
+        if i.is_multiple_of(64) || i == n_blobs {
+            progress::at(format!("{pass} {i}/{n_blobs}"));
+        }
     });
 
-    Locations { ids, packed: packed.into_iter().map(AtomicU64::into_inner).collect() }
+    Locations {
+        ids,
+        packed: packed.into_iter().map(AtomicU64::into_inner).collect(),
+    }
 }
 
 // --- row construction -----------------------------------------------------
@@ -460,11 +598,18 @@ fn resolve(ids: &[i64], locations: &Locations) -> Option<Vec<u64>> {
 }
 
 fn build_line(id: i64, tags: Tags, ways: &WayRefs, locations: &Locations) -> Option<Row> {
-    let pts: Vec<Pt> = resolve(ways.get(id)?, locations)?.into_iter().map(unpack).collect();
+    let pts: Vec<Pt> = resolve(ways.get(id)?, locations)?
+        .into_iter()
+        .map(unpack)
+        .collect();
     if pts.len() < 2 {
         return None;
     }
-    Some(Row { osm_id: id, tags, wkb: geom::wkb_linestring(&pts) })
+    Some(Row {
+        osm_id: id,
+        tags,
+        wkb: geom::wkb_linestring(&pts),
+    })
 }
 
 /// `rings` is already assembled and resolved: closed sequences of positions.
@@ -486,5 +631,9 @@ fn build_area(osm_id: i64, tags: Tags, rings: Vec<Vec<u64>>, min_span: f64) -> O
     if geom::outer_span(&polys) < min_span {
         return None;
     }
-    Some(Row { osm_id, tags, wkb: geom::wkb_multipolygon(&polys) })
+    Some(Row {
+        osm_id,
+        tags,
+        wkb: geom::wkb_multipolygon(&polys),
+    })
 }

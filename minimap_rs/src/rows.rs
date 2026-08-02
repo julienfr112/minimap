@@ -160,7 +160,10 @@ pub struct RawTable<'a> {
 
 impl<'a> RawTable<'a> {
     pub fn new(appender: Appender<'a>) -> RawTable<'a> {
-        RawTable { appender, written: 0 }
+        RawTable {
+            appender,
+            written: 0,
+        }
     }
 
     /// Flushes whatever is still buffered. Dropping the appender instead would

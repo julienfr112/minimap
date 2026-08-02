@@ -1,0 +1,17 @@
+[package]
+name = "anon-bake"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "anon-bake"
+path = "src/main.rs"
+
+[dependencies]
+anon-format = { path = "../format" }
+# The building footprints come from the tile pipeline's `features` table, so the
+# bake needs the same DuckDB the pipeline was built with. Nothing in the service
+# does.
+duckdb = { version = "1.10505", features = ["bundled"] }
+# One parallel sort of ~29M keys. It is the only step that is not I/O.
+rayon = "1"

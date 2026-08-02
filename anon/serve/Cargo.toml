@@ -1,0 +1,17 @@
+[package]
+name = "anon-serve"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "anon-serve"
+path = "src/main.rs"
+
+[dependencies]
+anon-format = { path = "../format" }
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# The index is mmapped rather than read: a 320 MB file where a request touches
+# two pages has no business being resident, and the kernel decides better than a
+# cache would.
+memmap2 = "0.9"

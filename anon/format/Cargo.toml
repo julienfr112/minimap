@@ -1,0 +1,9 @@
+[package]
+name = "anon-format"
+version = "0.1.0"
+edition = "2021"
+
+# No dependencies, deliberately. This crate is the *only* thing the bake and the
+# service agree on, so it has to be cheap enough for the service to link without
+# dragging anything into a process that answers untrusted requests.
+[dependencies]

@@ -1,10 +1,26 @@
 # One workspace, two binaries, and the split between them is the point of the
-# project: `minimap` builds the archive and needs DuckDB, GEOS and a PBF parser;
-# `minimap-backend` serves it and needs none of them. Nothing in backend/'s
+# project: `minimap_rs` builds the archives and needs DuckDB, GEOS and a PBF
+# parser; `server` serves them and needs none of them. Nothing in server/'s
 # dependency tree can reach a database, which is what keeps the deployed thing a
 # mmap and two binary searches.
+#
+# The top level is organised by *content*, so what a directory holds is its name:
+# `pbf/` what was downloaded, `duckdb/` the database built from it, `pmtiles/`
+# the archives that ship, `server/` what serves them, `minimap_rs/` what makes
+# them.
+#
+# `anon/` is a separate service built on the same split, and on the same
+# `features` table: `anon-bake` reads footprints out of DuckDB and cuts the world
+# into zones of k buildings, `anon-serve` answers positions from the result, and
+# `anon-format` is the ~200 lines they both have to agree on byte for byte.
 [workspace]
-members = ["pipeline", "backend"]
+members = [
+    "minimap_rs",
+    "server",
+    "anon/format",
+    "anon/bake",
+    "anon/serve",
+]
 resolver = "2"
 
 [profile.release]

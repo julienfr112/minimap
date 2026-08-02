@@ -1,9 +1,25 @@
-# Downloaded OSM extracts (31.7 GB of country PBFs) and everything the
-# pipeline generates from them. All of it is rebuildable with `minimap all`.
+# Organised by content, and the .gitignore follows: everything here is either
+# downloaded or computed, and all of it is reproducible with `make all`.
+
+# Downloaded. 31 GB of country extracts plus the coastline OSM has no ocean for.
+pbf/
+
+# Computed. The database dwarfs the archives -- 154 GB against 15 GB at Europe
+# scale -- and both are pure functions of pbf/ plus the Makefile's settings.
+duckdb/
+pmtiles/
+log/
+
+# Artefacts from before the layout was organised by content. `make adopt` moves
+# what it can into place, after which these lines do nothing.
 data/
+build/
 *.duckdb
 *.duckdb.wal
+*.duckdb.tmp/
 *.pmtiles
+*.log
+anon/anon-zones.bin
 
 # Rust build output
 target/

@@ -41,6 +41,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "anon-bake"
+version = "0.1.0"
+dependencies = [
+ "anon-format",
+ "duckdb",
+ "rayon",
+]
+
+[[package]]
+name = "anon-format"
+version = "0.1.0"
+
+[[package]]
+name = "anon-serve"
+version = "0.1.0"
+dependencies = [
+ "anon-format",
+ "axum",
+ "memmap2 0.9.11",
+ "tokio",
+]
+
+[[package]]
 name = "anyhow"
 version = "1.0.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"

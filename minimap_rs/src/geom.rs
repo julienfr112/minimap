@@ -35,7 +35,12 @@ pub struct Ring {
 
 impl Ring {
     pub fn new(pts: Vec<Pt>) -> Ring {
-        let mut bbox = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+        let mut bbox = [
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        ];
         let mut acc = 0.0;
         for w in pts.windows(2) {
             let (a, b) = (w[0], w[1]);
@@ -45,7 +50,11 @@ impl Ring {
             bbox[3] = bbox[3].max(a[1]);
             acc += a[0] * b[1] - b[0] * a[1];
         }
-        Ring { pts, bbox, area: acc / 2.0 }
+        Ring {
+            pts,
+            bbox,
+            area: acc / 2.0,
+        }
     }
 
     /// Reverse in place unless the winding already matches `ccw`.
@@ -92,7 +101,11 @@ pub fn assemble_rings(parts: Vec<Vec<u64>>) -> Option<Vec<Vec<u64>>> {
     for part in &parts {
         for w in part.windows(2) {
             if w[0] != w[1] {
-                segments.push(if w[0] < w[1] { [w[0], w[1]] } else { [w[1], w[0]] });
+                segments.push(if w[0] < w[1] {
+                    [w[0], w[1]]
+                } else {
+                    [w[1], w[0]]
+                });
             }
         }
     }
@@ -197,7 +210,11 @@ fn ring_contains(outer: &Ring, inner: &Ring) -> bool {
 pub fn classify(rings: Vec<Ring>) -> Vec<Polygon> {
     let mut order: Vec<usize> = (0..rings.len()).collect();
     order.sort_by(|&a, &b| {
-        rings[b].area.abs().partial_cmp(&rings[a].area.abs()).unwrap_or(std::cmp::Ordering::Equal)
+        rings[b]
+            .area
+            .abs()
+            .partial_cmp(&rings[a].area.abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
 
     let mut parent = vec![usize::MAX; rings.len()];
