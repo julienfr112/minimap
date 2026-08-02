@@ -331,6 +331,7 @@ minimap_rs/        the build tool: download / load / bake / export / info / sql
   src/sql.rs         `minimap sql` -- ask the build database something
   attic/             programs that were needed once; see its README
 server/            serves the archives: axum + mmapped PMTiles, no database
+  README.md          embedding the map and/or the zones in your own axum app
   web/index.html     page shell
   web/minimap.js     protobuf reader + MVT decoder + canvas renderer
 anon/              a separate service on the same `features` table

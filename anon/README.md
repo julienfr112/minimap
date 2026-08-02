@@ -259,4 +259,6 @@ means anyone who asks twice keeps the smaller answer. One `k` per deployment
 
 The map server (`../server/`) embeds the same lookup for the viewer's click,
 so the map needs no second process; `serve/` is for deploying the answer
-*without* the map.
+*without* the map. To embed the lookup in your *own* axum application —
+`format/` is a dependency-free crate for exactly that reason — see
+`../server/README.md`, which also covers what a host app must not do to it.
