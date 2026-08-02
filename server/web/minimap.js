@@ -242,6 +242,19 @@ const LABELS = {
 const LABEL_COLOR = '#3a3733';
 const LABEL_HALO = 'rgba(255, 255, 255, 0.9)';
 
+// The anon zone overlay (see anon/README.md). The server sends the zone's cells
+// as lon/lat boxes, and filling them shows the anonymity set's true shape.
+// Only the fill: the response's bbox is a bound, not the zone, and drawing it
+// read as "the zone is this whole rectangle" -- twice the area the answer
+// actually stands for. One warm accent, against a map that is otherwise paper
+// and pastel.
+const ZONE_FILL = 'rgba(192, 57, 43, 0.18)';
+const ZONE_EDGE = 'rgba(192, 57, 43, 0.85)';
+
+// A click and a drag arrive as the same pointer events, so a click is a
+// press-and-release that travelled less than this many pixels.
+const CLICK_SLOP = 4;
+
 // Roads get thicker as you zoom in, but sub-linearly.
 function widthScale(zoom) { return 1.6 * 2 ** ((zoom - 10) / 2.4); }
 
@@ -325,6 +338,10 @@ class Minimap {
       this.zoom = this.#snap(+hash[1]);
       this.center = { lon: +hash[3], lat: +hash[2] };
     }
+    // Whether the server can answer /zone, from meta.json -- and the last
+    // answer it gave, drawn as an overlay until Escape or a new click.
+    this.anon = meta.anon ?? null;
+    this.zone = null;
     this.tiles = new Map(); // "z/x/y" -> layers | 'loading' | 'empty'  (see #keep)
     this.rasters = new Map(); // "z/x/y|layers@zoom" -> canvas  (see #paint)
     this.rasterBytes = 0;
@@ -381,9 +398,9 @@ class Minimap {
   #bindEvents() {
     window.addEventListener('resize', () => this.resize());
 
-    let lastX = 0, lastY = 0;
+    let lastX = 0, lastY = 0, downX = 0, downY = 0;
     this.canvas.addEventListener('pointerdown', (e) => {
-      this.dragging = true; lastX = e.clientX; lastY = e.clientY;
+      this.dragging = true; lastX = downX = e.clientX; lastY = downY = e.clientY;
       this.canvas.setPointerCapture(e.pointerId);
       this.canvas.style.cursor = 'grabbing';
     });
@@ -399,7 +416,10 @@ class Minimap {
       this.canvas.style.cursor = 'grab';
       this.dirty = true;
     };
-    this.canvas.addEventListener('pointerup', stop);
+    this.canvas.addEventListener('pointerup', (e) => {
+      stop();
+      if (Math.hypot(e.clientX - downX, e.clientY - downY) < CLICK_SLOP) this.#pick(e);
+    });
     this.canvas.addEventListener('pointercancel', stop);
 
     // Wheel deltas are reported in three different units depending on the
@@ -429,9 +449,45 @@ class Minimap {
     window.addEventListener('keydown', (e) => {
       if (e.key === '+' || e.key === '=') this.#zoomBy(1);
       else if (e.key === '-' || e.key === '_') this.#zoomBy(-1);
+      else if (e.key === 'Escape') { this.zone = null; this.dirty = true; onZone(null); }
       else return;
       e.preventDefault();
     });
+  }
+
+  // Ask the server which anon zone stands in for the clicked point, and keep
+  // the answer for the overlay. POST rather than GET on the same reasoning as
+  // the service itself: a URL lands in history and logs by default, and here
+  // the position is the user's own click.
+  //
+  // The click point is remembered client-side for the marker; the server's
+  // answer never contains it (see anon/format -- every response field is a
+  // function of the zone alone).
+  #pick(e) {
+    if (!this.anon) return;
+    const rect = this.canvas.getBoundingClientRect();
+    const world = TILE * 2 ** this.zoom;
+    const c = project(this.center.lon, this.center.lat);
+    const [lon, lat] = unproject(
+      c[0] + (e.clientX - rect.left - this.w / 2) / world,
+      c[1] + (e.clientY - rect.top - this.h / 2) / world,
+    );
+    fetch('/zone', {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: `lat=${lat.toFixed(6)}&lon=${lon.toFixed(6)}`,
+    })
+      .then(async (r) => {
+        const body = await r.json();
+        if (!r.ok) throw new Error(body.error ?? r.status);
+        this.zone = { ...body, point: [lon, lat] };
+        onZone(this.zone);
+      })
+      .catch((err) => {
+        this.zone = null;
+        onZone(null, err.message);
+      })
+      .finally(() => { this.dirty = true; });
   }
 
   // Offset in world (normalized 0..1) units for a pixel offset from centre.
@@ -576,8 +632,39 @@ class Minimap {
     // collide across tile boundaries, so they cannot be baked into a bitmap.
     this.#identity();
     this.#drawLabels(labelled);
+    this.#drawZone(world, originX, originY);
 
     onStatus(this);
+  }
+
+  // The anon zone overlay: the zone's cells filled, and a dot on the clicked
+  // point. Geographic, so it survives pan and zoom; on top of the labels,
+  // because it is the thing being asked about.
+  #drawZone(world, originX, originY) {
+    const z = this.zone;
+    if (!z) return;
+    const ctx = this.ctx;
+    const px = (lon, lat) => {
+      const p = project(lon, lat);
+      return [p[0] * world - originX, p[1] * world - originY];
+    };
+    ctx.beginPath();
+    for (const [w, s, e, n] of z.quads) {
+      const [x0, y0] = px(w, n);
+      const [x1, y1] = px(e, s);
+      ctx.rect(x0, y0, x1 - x0, y1 - y0);
+    }
+    ctx.fillStyle = ZONE_FILL;
+    ctx.fill();
+    const [cx, cy] = px(z.point[0], z.point[1]);
+    ctx.beginPath();
+    ctx.arc(cx, cy, 4, 0, 2 * Math.PI);
+    ctx.fillStyle = LABEL_HALO;
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(cx, cy, 2.5, 0, 2 * Math.PI);
+    ctx.fillStyle = ZONE_EDGE;
+    ctx.fill();
   }
 
   #layer(tile, name) { return tile.layers.get(name); }
@@ -853,6 +940,7 @@ class Minimap {
 // ------------------------------------------------------------------- boot
 
 let onStatus = () => {};
+let onZone = () => {};
 
 async function main() {
   const meta = await (await fetch('/meta.json')).json();
@@ -873,6 +961,23 @@ async function main() {
     }, 300);
   };
   onStatus(map);
+
+  // The zone panel says what the answer *means*, in the response's own terms:
+  // the click is somewhere among `buildings` buildings in the painted cells.
+  const zonePanel = document.getElementById('zone');
+  onZone = (z, error) => {
+    zonePanel.hidden = !z && !error;
+    if (error) {
+      zonePanel.textContent = `zone: ${error}`;
+    } else if (z) {
+      const area = z.area_km2 >= 10 ? z.area_km2.toFixed(0) : z.area_km2.toFixed(2);
+      zonePanel.textContent =
+        `${z.kind} · one of ${z.buildings} buildings · ±${Math.round(z.radius_m)} m` +
+        ` · ${area} km² · k=${z.k} · esc to clear`;
+    }
+  };
+  if (map.anon) document.getElementById('help').textContent += ' · click for anon zone';
+
   document.getElementById('attribution').innerHTML = meta.attribution;
   window.map = map; // handy in the console
 }

@@ -1054,6 +1054,7 @@ dependencies = [
 name = "minimap-backend"
 version = "0.1.0"
 dependencies = [
+ "anon-format",
  "axum",
  "flate2",
  "memmap2 0.9.11",

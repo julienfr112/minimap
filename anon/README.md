@@ -9,9 +9,9 @@ serve is a lookup.
 
 ```
 DuckDB `features`  --anon-bake-->  anon-zones.bin  --anon-serve-->  HTTP
-121.6M buildings    Hilbert cut     8.8M zones      binary search    one JSON
-35s, 3 tiers of k   4.4 B a zone    + one block scan no geometry code
-                    38.9 MB, all of Europe
+236.8M buildings    Hilbert cut     15.8M zones     binary search    one JSON
+90s, 3 tiers of k   4.5 B a zone    + one block scan no geometry code
+                    70.3 MB, all of Europe
 ```
 
 The lookup is one function over one file — [`Index::zone`] — and the file is the
@@ -21,16 +21,23 @@ consulted: no database, no geometry library, no decompression pass.
 [`Index::zone`]: format/src/lib.rs
 
 ```bash
-cargo run --release -p anon-bake            # 35 s over Europe
-cargo run --release -p anon-serve           # http://127.0.0.1:8091
+make anon           # cut the zones from the pipeline database (35 s over Europe)
+make anon-serve     # the standalone service, http://127.0.0.1:8091
 curl -d 'lat=49.8949&lon=2.3020' localhost:8091/zone
 ```
 
+Flags go through `ANON_FLAGS` (`make anon ANON_FLAGS='--min-footprint 25'`);
+`anon-bake --help` lists them. The map server picks the index up too: after
+`make anon`, `make serve` grows a `/zone` endpoint and the viewer lets you
+**click a point to see its zone** — the exact cells, filled; not the bbox,
+which is a bound and reads twice as big — because the honest way to explain
+"you are one of 74 buildings in here" is to draw the here.
+
 ```json
-{"zone":"d99798fa5","k":64,"buildings":69,
- "bbox":[2.300262,49.894634,2.307129,49.898173],"center":[2.303696,49.896404],
- "radius_m":315,"area_km2":0.116,"cells":12,
- "density_per_km2":484,"built_index":35.34,"kind":"city"}
+{"zone":"3665e63eb4","k":64,"buildings":74,
+ "bbox":[2.300262,49.894634,2.304382,49.896404],"center":[2.302322,49.895519],
+ "radius_m":178,"area_km2":0.039,"cells":16,
+ "density_per_km2":3136,"built_index":49.78,"kind":"city"}
 ```
 
 `POST` because a URL ends up in access logs, browser history, `Referer` headers
@@ -69,6 +76,12 @@ the position that asked, which is the one thing a box drawn around the zone's
 that. `area_km2` is the zone itself and not the box, so the two differ by however
 much the curve wandered.
 
+The map server's `/zone` answers with one more field: `quads`, the zone's cells
+as `[w,s,e,n]` boxes (a few dozen at most — a zone is an interval of the curve,
+and an interval decomposes into aligned squares). That is the zone's true shape,
+and what the viewer fills in when you click. It is still a function of the zone
+alone, so it discloses nothing the zone id did not.
+
 ## Why not just round the coordinates
 
 Because a fixed precision is a fixed area, and area is not privacy. Three
@@ -93,10 +106,13 @@ and a privacy budget, which is a different service than this one.
 
 ## How the zones are built
 
-Buildings are binned on a fixed Web Mercator grid at z18 (102 m cells at
+Buildings are binned on a fixed Web Mercator grid at z19 (51 m cells at
 Amiens), the occupied cells are put in **Hilbert order**, and the curve is cut
-wherever the running building count reaches `k`. A zone is one interval of the
-curve. A lookup is: project, bin, Hilbert, one binary search.
+wherever the running building count reaches `k` — at the most coarsely aligned
+key that costs the zone nothing extra, so boundaries land on quadtree corners
+where the curve grows in blocks rather than ribbons (see `cut` for the two
+rules that keep this free). A zone is one interval of the curve. A lookup is:
+project, bin, Hilbert, one binary search.
 
 Two properties make it safe, and both are easy to lose:
 
@@ -139,21 +155,21 @@ position standing in a field between them. The interval always does.
 What is left per zone — a breakpoint, a count, and two quantised bytes — is delta
 coded in blocks of 64 against a sampled skip table. A lookup binary-searches the
 skip entries and scans one block: a few hundred contiguous bytes, whatever the
-index weighs. Over Europe that comes to **4.4 bytes a zone**, 38.9 MB for three
-tiers — down from 317.9 MB, an 8.2× reduction.
+index weighs. Over Europe that comes to **4.5 bytes a zone**, 70.3 MB for three
+tiers — against the 16 bytes a breakpoint alone would cost stored plainly.
 
 The cost of a lookup, on a synthetic continent so it needs no database (a
 sparser one than Europe, hence the larger bytes-per-zone):
 
 ```bash
 cargo run --release -p anon-format --example cost
-271415 zones, 1.7 MB, 6.14 bytes a zone
-2682 ns a lookup, of which ~1478 ns rebuilding the geometry
+250280 zones, 1.5 MB, 6.14 bytes a zone
+1265 ns a lookup, of which ~427 ns rebuilding the geometry
 ```
 
-2.7 µs is slower than reading a fixed-size record would be, and worth being
-straight about: over half of it is arithmetic rebuilding the geometry, not memory.
-370k lookups a second on one core was never the constraint; resident memory was.
+1.3 µs is slower than reading a fixed-size record would be, and worth being
+straight about: a third of it is arithmetic rebuilding the geometry, not memory.
+790k lookups a second on one core was never the constraint; resident memory was.
 
 |  |  |
 |---|---|
@@ -172,16 +188,16 @@ of Europe ships inside an application or beside one.
 `anon-bake` prints what each `k` buys, by the kind of place it buys it in, which
 is the table to decide from — a single median over all zones hides the point,
 since the countryside contributes most of the zones and almost none of the
-positions. Over Picardie:
+positions. Over Europe:
 
 ```
-k=64: 1 822 591 zones
-  city-centre     29 699 zones   radius p50    249 m   p90    453 m
-  city           166 551 zones   radius p50    285 m   p90    515 m
-  suburb         429 253 zones   radius p50    324 m   p90    684 m
-  village        556 321 zones   radius p50    484 m   p90   1272 m
-  countryside    639 785 zones   radius p50   1456 m   p90   3525 m
-  wilderness         982 zones   radius p50   9231 m   p90  20976 m
+k=64: 3 104 759 zones
+  city-centre     82 591 zones   radius p50    148 m   p90    311 m
+  city           424 472 zones   radius p50    171 m   p90    354 m
+  suburb         793 617 zones   radius p50    212 m   p90    504 m
+  village        897 955 zones   radius p50    321 m   p90    974 m
+  countryside    902 174 zones   radius p50   1060 m   p90   2761 m
+  wilderness       3 950 zones   radius p50   5491 m   p90  13374 m
 ```
 
 The ladder is calibrated against landmarks, which is the only test it can be held
@@ -215,9 +231,19 @@ means anyone who asks twice keeps the smaller answer. One `k` per deployment
 * **The service must not log the request line.** `lat`/`lon` are the thing being
   protected; an access log is a durable, greppable, backed-up record of exactly
   what the API exists to avoid passing on. `anon-serve` writes nothing, and the
-  proxy in front of it has to be configured not to either. Answers are
-  `Cache-Control: private` for the same reason — a CDN entry keyed on a lat/lon
-  URL is that log by another name.
+  proxy in front of it has to be configured not to either — which is one line,
+  and the one piece of this design that lives outside the repository:
+
+  ```nginx
+  location /zone {
+      access_log off;                    # the whole point
+      proxy_pass http://127.0.0.1:8091;
+  }
+  ```
+
+  (Caddy: `log_skip` on the route.) Answers are `Cache-Control: private` for
+  the same reason — a CDN entry keyed on a lat/lon URL is that log by another
+  name.
 * **Coverage is a disclosure.** A position outside the baked region gets a 404
   rather than the nearest zone on the wrong continent, which does say "outside
   Europe" about it. Deliberate, coarse, and the one documented exception to the
@@ -230,3 +256,7 @@ means anyone who asks twice keeps the smaller answer. One `k` per deployment
 | `format/` | The ~450 lines the two ends agree on byte for byte: Hilbert, the file layout, the lookup, and what a `Zone` is allowed to say. No dependencies. |
 | `bake/` | Reads `features`, cuts the curve, writes the index. Wants DuckDB. |
 | `serve/` | mmaps the index and answers `/zone`. Wants axum and 200 lines. |
+
+The map server (`../server/`) embeds the same lookup for the viewer's click,
+so the map needs no second process; `serve/` is for deploying the answer
+*without* the map.

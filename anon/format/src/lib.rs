@@ -177,7 +177,13 @@ pub fn cell_at(level: u32, d: u64) -> (u32, u32) {
 /// Finding a run's square needs no bookkeeping about which way the curve was
 /// facing: any cell inside an aligned square, masked down to a multiple of the
 /// side, is the square's corner.
-fn quads_of(level: u32, a: u64, b: u64, mut each: impl FnMut(u32, u32, u32)) {
+///
+/// Public because the squares are the zone's true shape, not just the means to
+/// its bbox: [`Index::quads`] hands them to a viewer that wants to *draw* the
+/// anonymity set. `each` receives `(x, y, side)` -- the square's north-west cell
+/// and its edge in cells. The squares are disjoint and cover the interval
+/// exactly; there are at most two per level, so a few dozen for any zone.
+pub fn quads_of(level: u32, a: u64, b: u64, mut each: impl FnMut(u32, u32, u32)) {
     let mut at = a;
     while at < b {
         // The largest aligned run starting at `at` that still fits in [a, b), as
@@ -429,6 +435,10 @@ pub struct Zone {
     /// unique within its tier, and usable as a grouping key by a caller that
     /// should not be handling coordinates at all.
     pub id: u64,
+    /// One past the zone's last Hilbert key: `[id, end)` *is* the zone, and is
+    /// what [`Index::quads`] turns back into shapes. A function of the zone
+    /// alone, like every other field -- it is the next zone's breakpoint.
+    pub end: u64,
     /// How many buildings a position in this zone could be at. `>= k`.
     pub buildings: u32,
     pub k: u32,
@@ -626,6 +636,7 @@ impl Index {
         let built_index = unpack_index(built);
         Some(Zone {
             id,
+            end,
             buildings,
             k: t.k,
             extent: extent_of(self.level, id, end).clip(self.bounds),
@@ -638,6 +649,34 @@ impl Index {
     fn skip(&self, bytes: &[u8], tier: &Tier, block: u32) -> (u64, u32) {
         let at = tier.skips as usize + block as usize * SKIP_LEN;
         (u64_at(bytes, at), u32_at(bytes, at + 8))
+    }
+
+    /// The zone's shape, as `[w, s, e, n]` rectangles in degrees -- one per
+    /// aligned square of its interval, so a few dozen at most, disjoint, and
+    /// together exactly the cells a position answering with this zone could be
+    /// in. This is for *drawing* the anonymity set; the bbox alone overstates it
+    /// wherever the curve wandered.
+    ///
+    /// Clipped to the covered region for the same reason [`Extent::clip`] clips
+    /// the bbox: the first and last zone of a tier take in every empty cell
+    /// before or after the data, and a rectangle the size of a hemisphere is not
+    /// information, it is the edge of the file. A square entirely outside the
+    /// bounds vanishes; the anonymity set is not clipped by any of this, only
+    /// its picture.
+    pub fn quads(&self, zone: &Zone) -> Vec<[f64; 4]> {
+        let mut out = Vec::new();
+        quads_of(self.level, zone.id, zone.end, |x, y, side| {
+            let quad = [
+                lon_of(self.level, x).max(self.bounds[0]),
+                lat_of(self.level, y + side).max(self.bounds[1]),
+                lon_of(self.level, x + side).min(self.bounds[2]),
+                lat_of(self.level, y).min(self.bounds[3]),
+            ];
+            if quad[0] < quad[2] && quad[1] < quad[3] {
+                out.push(quad);
+            }
+        });
+        out
     }
 }
 
@@ -757,28 +796,122 @@ impl Record {
 ///   * Cells are atomic: a cut never falls inside one. That is what makes "the
 ///     same cell always answers the same zone" true, and it is also why a zone
 ///     can overshoot k, since one dense cell can carry hundreds of buildings.
-pub fn cut(bins: &[Bin], k: u32) -> Vec<Record> {
+///
+/// A fourth detail carries only the *shape*, and its rule is: take what is
+/// free, pay for nothing. The zone's bounding box is what the caller
+/// experiences (the radius is its diagonal), so the cut is the first key past
+/// the k-th building -- and then everything that does not grow that box is
+/// taken anyway:
+///
+///   * A cut between two occupied cells may land anywhere in the empty run
+///     between them, so it lands on the run's most coarsely aligned key --
+///     which is also its earliest. This zone's box shrinks by the rest of the
+///     gap, and the next zone starts on a quadtree corner, where the curve
+///     grows in blocks rather than ribbons.
+///   * Cells past the crossing that sit *inside* the box already being paid
+///     for are absorbed when the cut beyond them is better aligned: same box,
+///     same radius, more buildings hidden in it, and a squarer start for the
+///     next zone. The count still may not pass 2k, as a backstop; a single
+///     dense cell can exceed both, as it always could.
+///
+/// Nothing here can make any zone's box larger than the first-crossing cut
+/// gave it, which is what the previous version of this choice got wrong: it
+/// paid box growth for alignment, and in uniform fabric that rounded every
+/// zone up to the next block size. The partition is exactly as total as
+/// before; the only thing that moved is where it folds.
+pub fn cut(level: u32, bins: &[Bin], k: u32) -> Vec<Record> {
     let mut zones: Vec<Record> = Vec::new();
-    let mut open: Option<Record> = None;
-    for b in bins {
-        let z = open.get_or_insert_with(|| Record::new(b.key));
-        z.absorb(b);
-        if z.buildings >= k {
-            zones.push(open.take().expect("just filled"));
+    let mut start = 0u64;
+    let mut i = 0;
+    while i < bins.len() {
+        let mut z = Record::new(start);
+        while i < bins.len() && z.buildings < k {
+            z.absorb(&bins[i]);
+            i += 1;
         }
-    }
-    if let Some(tail) = open.take() {
-        match zones.last_mut() {
-            Some(prev) => prev.absorb_zone(&tail),
-            // Fewer than k buildings in the whole bake: one zone, and `encode`
-            // lets it through short because there is nothing to merge it into.
-            None => zones.push(tail),
+        if z.buildings < k {
+            // The tail. Fewer than k buildings in the whole bake leaves nothing
+            // to merge it into, and `encode` lets that single zone through.
+            match zones.last_mut() {
+                Some(prev) => prev.absorb_zone(&z),
+                None => zones.push(z),
+            }
+            return zones;
         }
-    }
-    if let Some(first) = zones.first_mut() {
-        first.start = 0;
+        if i == bins.len() {
+            // The count crossed k on the last cell: the zone runs to the end of
+            // the curve and there is no cut left to choose.
+            zones.push(z);
+            return zones;
+        }
+        // One candidate per gap: its coarsest key. The box only grows with the
+        // cut, so the scan ends at the first candidate that would enlarge it.
+        let mut best = aligned_in(bins[i - 1].key, bins[i].key);
+        let mut best_at = i;
+        let mut best_score = alignment(best, start);
+        let paid = box2(level, start, best);
+        let mut count = u64::from(z.buildings);
+        for j in i + 1..bins.len() {
+            count += u64::from(bins[j - 1].buildings);
+            if count >= 2 * u64::from(k) {
+                break;
+            }
+            let cand = aligned_in(bins[j - 1].key, bins[j].key);
+            if box2(level, start, cand) > paid {
+                break;
+            }
+            let score = alignment(cand, start);
+            if score > best_score {
+                (best, best_at, best_score) = (cand, j, score);
+            }
+        }
+        for b in &bins[i..best_at] {
+            z.absorb(b);
+        }
+        i = best_at;
+        start = best;
+        zones.push(z);
     }
     zones
+}
+
+/// The most coarsely aligned key in `(lo, hi]`: `hi` rounded down to ever larger
+/// quadtree squares, for as long as that stays past `lo`.
+fn aligned_in(lo: u64, hi: u64) -> u64 {
+    let mut best = hi;
+    for j in 1..32 {
+        let b = hi & !((1u64 << (2 * j)) - 1);
+        if b <= lo {
+            break;
+        }
+        best = b;
+    }
+    best
+}
+
+/// How good `cut` is as the end of an interval starting at `start`: its
+/// alignment in quadtree levels, capped one level above the interval's own size
+/// -- an end aligned coarser than the whole interval buys no more shape.
+fn alignment(cut: u64, start: u64) -> u32 {
+    let align = cut.trailing_zeros() / 2;
+    let size = (63 - (cut - start).leading_zeros()) / 2 + 1;
+    align.min(size)
+}
+
+/// Squared diagonal of the interval's bounding box, in cells. What the cut
+/// choice holds against its slack: all it needs is *comparable*, so this stays
+/// in grid units and skips the geography.
+fn box2(level: u32, a: u64, b: u64) -> u64 {
+    let (mut min_x, mut min_y, mut max_x, mut max_y) = (u32::MAX, u32::MAX, 0u32, 0u32);
+    quads_of(level, a, b, |x, y, side| {
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x + side - 1);
+        max_y = max_y.max(y + side - 1);
+    });
+    let w = u64::from(max_x - min_x) + 1;
+    let h = u64::from(max_y - min_y) + 1;
+    w * w + h * h
 }
 
 // --- writing --------------------------------------------------------------
@@ -1042,7 +1175,7 @@ mod tests {
 
         for k in [2, 16, 64, 512] {
             for block in [1, 7, 64] {
-                let zones = cut(&bins, k);
+                let zones = cut(level, &bins, k);
                 let bytes = encode(level, block, WORLD_BOUNDS, &[(k, zones.clone())]).unwrap();
                 let ix = Index::parse(&bytes).unwrap();
 
@@ -1083,6 +1216,103 @@ mod tests {
         }
     }
 
+    /// The property `quads_of` promises its callers: the squares are disjoint,
+    /// aligned, and together are exactly the interval's cells -- so drawing them
+    /// draws the anonymity set, no more and no less.
+    #[test]
+    fn quads_tile_the_interval_exactly() {
+        for level in 1..=4 {
+            let n = 1u64 << (2 * level);
+            for a in 0..n {
+                for b in a + 1..=n {
+                    let mut cells = std::collections::HashSet::new();
+                    quads_of(level, a, b, |x, y, side| {
+                        assert_eq!(x % side, 0, "unaligned square at ({x},{y})");
+                        assert_eq!(y % side, 0, "unaligned square at ({x},{y})");
+                        for cy in y..y + side {
+                            for cx in x..x + side {
+                                assert!(cells.insert((cx, cy)), "({cx},{cy}) twice");
+                            }
+                        }
+                    });
+                    assert_eq!(cells.len() as u64, b - a, "[{a},{b}) at level {level}");
+                    for d in a..b {
+                        assert!(cells.contains(&cell_at(level, d)));
+                    }
+                }
+            }
+        }
+    }
+
+    /// What choosing the cut buys, measured rather than hoped: against the
+    /// first-crossing cut, zones get rounder (smaller radius for the same k,
+    /// building-weighted, which is how a position experiences them) and stay
+    /// bounded (at most 2k unless a single cell alone exceeds it -- the
+    /// overshoot is the price of the shape, and it has a ceiling).
+    #[test]
+    fn chosen_cuts_beat_first_crossing_cuts() {
+        let level = 6;
+        let bins = continent(level);
+        let biggest_cell = bins.iter().map(|b| b.buildings).max().unwrap();
+
+        // The first-crossing cut this replaced, kept here as the yardstick.
+        let naive = |k: u32| -> Vec<Record> {
+            let mut zones: Vec<Record> = Vec::new();
+            let mut open: Option<Record> = None;
+            for b in &bins {
+                let z = open.get_or_insert_with(|| Record::new(b.key));
+                z.absorb(b);
+                if z.buildings >= k {
+                    zones.push(open.take().unwrap());
+                }
+            }
+            if let Some(tail) = open {
+                zones.last_mut().unwrap().absorb_zone(&tail);
+            }
+            zones[0].start = 0;
+            zones
+        };
+
+        // Building-weighted mean radius: sum over zones of radius * buildings.
+        let mean_radius = |zones: &[Record]| -> f64 {
+            let end_of = |i: usize| {
+                zones
+                    .get(i + 1)
+                    .map_or(1u64 << (2 * level), |z: &Record| z.start)
+            };
+            let total: f64 = zones.iter().map(|z| f64::from(z.buildings)).sum();
+            zones
+                .iter()
+                .enumerate()
+                .map(|(i, z)| {
+                    extent_of(level, z.start, end_of(i)).radius_m * f64::from(z.buildings)
+                })
+                .sum::<f64>()
+                / total
+        };
+
+        for k in [8, 32, 128] {
+            let chosen = cut(level, &bins, k);
+            for (i, z) in chosen.iter().enumerate() {
+                // The last zone absorbs the tail, so only it may pass 2k + one
+                // cell's worth.
+                if i + 1 < chosen.len() {
+                    assert!(
+                        z.buildings < 2 * k + biggest_cell,
+                        "k={k}: zone at {:x} holds {}",
+                        z.start,
+                        z.buildings
+                    );
+                }
+            }
+            let (ours, theirs) = (mean_radius(&chosen), mean_radius(&naive(k)));
+            assert!(
+                ours < theirs,
+                "k={k}: chosen cuts give radius {ours:.0} m vs {theirs:.0} m"
+            );
+        }
+    }
+
     /// The compressed stream has to give back exactly what went in -- the counts
     /// and both measures, within the quantiser's documented resolution.
     /// Clipping the reported box to the covered region must not clip away a
@@ -1102,7 +1332,7 @@ mod tests {
             lon_of(level, n / 3),
             lat_of(level, 0),
         ];
-        let bytes = encode(level, 64, bounds, &[(32, cut(&bins, 32))]).unwrap();
+        let bytes = encode(level, 64, bounds, &[(32, cut(level, &bins, 32))]).unwrap();
         let ix = Index::parse(&bytes).unwrap();
 
         let mut inside = 0;
@@ -1133,7 +1363,7 @@ mod tests {
     fn payloads_survive_the_round_trip() {
         let level = 6;
         let bins = continent(level);
-        let zones = cut(&bins, 32);
+        let zones = cut(level, &bins, 32);
         let bytes = encode(level, 64, WORLD_BOUNDS, &[(32, zones.clone())]).unwrap();
         let ix = Index::parse(&bytes).unwrap();
 
@@ -1165,7 +1395,7 @@ mod tests {
     #[test]
     fn nonsense_files_are_refused_not_misread() {
         let bins = continent(4);
-        let zones = cut(&bins, 16);
+        let zones = cut(4, &bins, 16);
         let good = encode(4, 8, WORLD_BOUNDS, &[(16, zones)]).unwrap();
         assert!(Index::parse(&good).is_ok());
 
@@ -1193,15 +1423,15 @@ mod tests {
 
     #[test]
     fn a_gap_in_the_partition_is_refused() {
-        let mut zones = cut(&continent(4), 16);
+        let mut zones = cut(4, &continent(4), 16);
         zones[0].start = 1; // no longer covers the start of the curve
         assert!(encode(4, 8, WORLD_BOUNDS, &[(16, zones)]).is_err());
 
-        let mut zones = cut(&continent(4), 16);
+        let mut zones = cut(4, &continent(4), 16);
         zones.swap(1, 2); // out of order
         assert!(encode(4, 8, WORLD_BOUNDS, &[(16, zones)]).is_err());
 
-        let mut zones = cut(&continent(4), 16);
+        let mut zones = cut(4, &continent(4), 16);
         zones[1].buildings = 3; // below k, and not the tail
         assert!(encode(4, 8, WORLD_BOUNDS, &[(16, zones)]).is_err());
     }

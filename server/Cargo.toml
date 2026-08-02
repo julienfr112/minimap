@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# The anonymity zones (see anon/README.md) ride along in the same process: the
+# viewer's click-for-a-zone needs a same-origin endpoint, and the lookup is a
+# dependency-free binary search over a second mmap -- not worth a second
+# service and a proxy rule until something needs them separated.
+anon-format = { path = "../anon/format" }
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
 # The archive is mmapped rather than read, so tile bytes are never copied into

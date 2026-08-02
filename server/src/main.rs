@@ -18,7 +18,7 @@ mod pmtiles;
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, RawQuery, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
@@ -43,6 +43,19 @@ struct App {
     /// In draw order, which is also the order the viewer is told about them.
     layers: Vec<Layer>,
     web: PathBuf,
+    /// The anonymity-zone index, if `make anon` has produced one. Optional on
+    /// purpose: the map works without it, and `/zone` answers 404 until it is
+    /// there.
+    anon: Option<Anon>,
+}
+
+/// Everything `/zone` needs, resolved once at startup -- in particular the
+/// tier, so the request path never chooses a k (see `Index::tier` for why a
+/// per-request k would hand every caller the smallest one baked).
+struct Anon {
+    map: memmap2::Mmap,
+    index: anon_format::Index,
+    tier: usize,
 }
 
 /// Draw order. The viewer has its own copy for styling, but the server decides
@@ -114,12 +127,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     layers.sort_by_key(|l| ORDER.iter().position(|o| *o == l.name).unwrap_or(usize::MAX));
     println!("{} layers from {}", layers.len(), dir.display());
 
+    // Same knobs as anon-serve, so one set of docs covers both processes. A
+    // missing index is normal -- the map predates `make anon` -- but a corrupt
+    // one is refused loudly rather than served wrongly.
+    let anon_path = std::env::var("ANON_INDEX")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| root.join("anon/anon-zones.bin"));
+    let anon = match std::fs::File::open(&anon_path) {
+        Err(_) => {
+            println!("  no anon index at {} -- `make anon` enables /zone", anon_path.display());
+            None
+        }
+        Ok(file) => {
+            // SAFETY: the index is immutable for the life of the process; a
+            // re-bake writes a new file and the server restarts onto it, the
+            // same contract as the tile archives above.
+            let map = unsafe { memmap2::Mmap::map(&file)? };
+            let index = anon_format::Index::parse(&map)
+                .map_err(|e| format!("{}: {e}", anon_path.display()))?;
+            let wanted = match std::env::var("ANON_K") {
+                Ok(k) => Some(k.parse::<u32>()?),
+                Err(_) => None,
+            };
+            let tier = index.tier(wanted).ok_or_else(|| {
+                format!(
+                    "no tier for k={wanted:?} in {}; baked tiers are {:?}",
+                    anon_path.display(),
+                    index.tiers.iter().map(|t| t.k).collect::<Vec<_>>()
+                )
+            })?;
+            let t = index.tiers[tier];
+            println!(
+                "  anon         {:>9} zones  k={:<10} {:>8.1} MB",
+                t.zones,
+                t.k,
+                map.len() as f64 / 1e6
+            );
+            Some(Anon { map, index, tier })
+        }
+    };
+
     let app = Router::new()
         .route("/", get(index))
         .route("/meta.json", get(meta_json))
         .route("/tiles/{layer}/{z}/{x}/{y}", get(tile))
+        .route("/zone", get(zone_from_query).post(zone_from_body))
         .route("/{*path}", get(asset))
-        .with_state(Arc::new(App { layers, web: here.join("web") }));
+        .with_state(Arc::new(App { layers, web: here.join("web"), anon }));
 
     let port: u16 = std::env::var("MINIMAP_PORT")
         .ok()
@@ -209,15 +263,104 @@ async fn meta_json(State(s): State<S>) -> Response {
 
     let body = format!(
         r#"{{"tilejson":"3.0.0","scheme":"xyz","tiles":["/tiles/{{layer}}/{{z}}/{{x}}/{{y}}"],
-"minzoom":{lo},"maxzoom":{hi},"bounds":[{w},{sth},{e},{n}],"center":[{cx},{cy},{lo}],
+"minzoom":{lo},"maxzoom":{hi},"bounds":[{w},{sth},{e},{n}],"center":[{cx},{cy},{lo}],{anon}
 "layers":[
   {layers}
 ],
 "attribution":"{attribution}"}}"#,
         cx = (w + e) / 2.0,
         cy = (sth + n) / 2.0,
+        // Present only when /zone will answer, so the viewer can offer the
+        // click without probing for the endpoint.
+        anon = s
+            .anon
+            .as_ref()
+            .map(|a| format!("\n\"anon\":{{\"k\":{}}},", a.index.tiers[a.tier].k))
+            .unwrap_or_default(),
     );
     ([(header::CONTENT_TYPE, "application/json")], body).into_response()
+}
+
+// --- anon zones -------------------------------------------------------------
+// A position in, its k-anonymity zone out -- the same answer anon-serve gives,
+// plus `quads`: the zone's cells as lon/lat boxes, which is what the viewer
+// fills in so a click shows the anonymity set's true shape rather than its
+// bounding box. See anon/README.md for what the answer means and the one rule
+// every field obeys (a function of the zone alone, never of the position).
+
+/// `GET /zone?lat=&lon=` -- for curl and for people. The POST form is the one
+/// to build on: a URL lands in access logs, history and `Referer` headers by
+/// default, and the URL is the thing being protected.
+async fn zone_from_query(app: State<S>, RawQuery(query): RawQuery) -> Response {
+    zone(&app, &query.unwrap_or_default())
+}
+
+/// `POST /zone` with `lat=..&lon=..` as the body.
+async fn zone_from_body(app: State<S>, body: String) -> Response {
+    zone(&app, &body)
+}
+
+/// `lat=..&lon=..`, by hand -- two splits over one short string, and nothing
+/// here is echoed back or logged.
+fn param(form: &str, name: &str) -> Option<f64> {
+    form.split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(k, _)| *k == name)?
+        .1
+        .parse()
+        .ok()
+}
+
+fn zone(s: &App, form: &str) -> Response {
+    let Some(anon) = &s.anon else {
+        return zone_error(StatusCode::NOT_FOUND, "no zone index -- run `make anon`");
+    };
+    let (Some(lat), Some(lon)) = (param(form, "lat"), param(form, "lon")) else {
+        return zone_error(StatusCode::BAD_REQUEST, "lat and lon must be numbers");
+    };
+    if !lat.is_finite() || !lon.is_finite() || lat.abs() > 90.0 || lon.abs() > 180.0 {
+        return zone_error(StatusCode::BAD_REQUEST, "lat and lon out of range");
+    }
+    if !anon.index.covers(lat, lon) {
+        // The one thing this endpoint says about a position other than its
+        // zone. See `Index::bounds`.
+        return zone_error(StatusCode::NOT_FOUND, "outside the covered region");
+    }
+    let Some(z) = anon.index.zone(&anon.map, anon.tier, lat, lon) else {
+        return zone_error(StatusCode::INTERNAL_SERVER_ERROR, "no zone");
+    };
+    // The zone's own JSON, with the quads spliced in before the closing brace.
+    let mut body = z.to_json();
+    body.pop();
+    body.push_str(",\"quads\":[");
+    for (i, q) in anon.index.quads(&z).iter().enumerate() {
+        if i > 0 {
+            body.push(',');
+        }
+        body.push_str(&format!("[{:.6},{:.6},{:.6},{:.6}]", q[0], q[1], q[2], q[3]));
+    }
+    body.push_str("]}");
+    (
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            // The mapping is a property of the index, not of the caller, so an
+            // answer is cacheable -- but only where the position already is.
+            // `private` keeps it out of shared caches; a CDN entry keyed on a
+            // lat/lon URL is the access log this design refuses to write.
+            (header::CACHE_CONTROL, "private, max-age=3600"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+fn zone_error(code: StatusCode, why: &str) -> Response {
+    (
+        code,
+        [(header::CONTENT_TYPE, "application/json")],
+        format!("{{\"error\":\"{why}\"}}"),
+    )
+        .into_response()
 }
 
 async fn tile(

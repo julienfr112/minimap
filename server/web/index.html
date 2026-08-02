@@ -31,6 +31,7 @@
     }
     #hud { top: 10px; left: 10px; }
     #help { top: 10px; right: 10px; color: #555; }
+    #zone { bottom: 10px; left: 10px; border-color: rgba(192, 57, 43, .4); }
     #attribution { bottom: 10px; right: 10px; font-size: 11px; color: #444; }
     #attribution a { color: inherit; }
   </style>
@@ -39,6 +40,7 @@
   <canvas id="map"></canvas>
   <div class="panel" id="hud">loading…</div>
   <div class="panel" id="help">drag to pan · scroll to zoom</div>
+  <div class="panel" id="zone" hidden></div>
   <div class="panel" id="attribution"></div>
   <script src="/minimap.js"></script>
 </body>

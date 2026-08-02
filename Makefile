@@ -48,6 +48,17 @@ MEMORY  ?=
 JOBS    ?= 3
 # Where `make serve` listens.
 PORT    ?= 8090
+# The anonymity-zone index (see anon/README.md), cut from the same features
+# table by `make anon`. Optional: `make serve` works without it, and enables
+# click-for-a-zone in the viewer when it is there. Deleted by `clean`.
+ANON    ?= anon/anon-zones.bin
+# Which baked tier the servers answer from. 64 is a city block's worth of
+# vagueness (~200 m in Paris, ~1 km in open country); the index also carries 16
+# and 256, so changing this is a restart, not a re-bake.
+ANON_K  ?= 64
+# Extra anon-bake flags: --min-footprint 25 drops the sheds and barns that
+# inflate a hamlet's building count, --k 16,64,256 picks the tiers.
+ANON_FLAGS ?=
 
 # --- derived ---------------------------------------------------------------
 
@@ -96,7 +107,7 @@ BAKED    := $(DUCKDB)/.bake-$(REGION_ID)
 EXPORTED := $(PMTILES)/.export-$(REGION_ID)
 
 .DEFAULT_GOAL := help
-.PHONY: help all download europe load bake export serve info sql regions clean distclean adopt dirs targets
+.PHONY: help all download europe load bake export anon serve anon-serve info sql regions clean distclean adopt dirs targets
 
 # --- the pipeline ----------------------------------------------------------
 # Each stage writes its own log via --log, rather than being piped through tee.
@@ -132,11 +143,25 @@ $(EXPORTED): $(BAKED) | dirs
 	@$(MINIMAP) export $(COMMON) --log $(LOG)/export.log
 	@touch $@
 
+# The anon index is cut from the same `features` table, so it is stale whenever
+# the load is -- and whenever the anon code is, which the pipeline stamps do not
+# see. Off the `all` path on purpose: it is a second deliverable, not a stage.
+anon: $(ANON)
+$(ANON): $(LOADED) $(wildcard anon/format/src/*.rs) $(wildcard anon/bake/src/*.rs) | dirs
+	@$(if $(MEMORY),MINIMAP_MEMORY_LIMIT=$(MEMORY) ,)cargo run --release --quiet -p anon-bake -- \
+	  --db $(DB) --out $@ $(ANON_FLAGS)
+
 # --- using the result ------------------------------------------------------
 
 serve: $(EXPORTED)
-	@MINIMAP_TILES=$(PMTILES) MINIMAP_PORT=$(PORT) \
+	@MINIMAP_TILES=$(PMTILES) MINIMAP_PORT=$(PORT) ANON_INDEX=$(ANON) ANON_K=$(ANON_K) \
 	  cargo run --release --quiet --bin minimap-backend
+
+# The standalone zone service, for deploying the lookup without the map --
+# same index, same answers, none of the tiles. See anon/README.md for the
+# proxy configuration it needs in front of it (in short: no request logging).
+anon-serve: $(ANON)
+	@ANON_INDEX=$(ANON) ANON_K=$(ANON_K) cargo run --release --quiet -p anon-serve
 
 info:
 	@$(MINIMAP) info $(COMMON)
@@ -165,6 +190,7 @@ clean:
 	@for d in $(DUCKDB) $(PMTILES) $(LOG); do \
 	    if [ -d "$$d" ]; then echo "removing $$d ($$(du -sh $$d | cut -f1))"; rm -rf "$$d"; fi; \
 	done
+	@if [ -e "$(ANON)" ]; then echo "removing $(ANON) ($$(du -h $(ANON) | cut -f1))"; rm -f "$(ANON)"; fi
 	@echo "kept $(PBF) ($$(du -sh $(PBF) 2>/dev/null | cut -f1 || echo 'nothing yet')) — rebuild with: make all"
 
 distclean: clean
@@ -190,6 +216,7 @@ adopt: | dirs
 targets:
 	@echo "deliverable -- copy this to the server, nothing else"
 	@printf "  %-40s %s\n" "$(PMTILES)/<layer>.pmtiles" "one archive per layer"
+	@printf "  %-40s %s\n" "$(ANON)" "the anonymity zones, if 'make anon' ran"
 	@echo
 	@echo 'scaffolding -- rebuildable, safe to delete, "make clean" removes it' 
 	@printf "  %-40s %s\n" "$(DB)" "features + tile_layers + meta"
@@ -215,7 +242,9 @@ help:
 	@echo "  make load        PBF -> DuckDB features"
 	@echo "  make bake        features -> MVT tiles"
 	@echo "  make export      tiles -> PMTiles archive"
-	@echo "  make serve       serve it on :$(PORT)"
+	@echo "  make anon        cut k-anonymity zones from the database (see anon/)"
+	@echo "  make serve       serve it on :$(PORT) -- with click-for-a-zone if anon ran"
+	@echo "  make anon-serve  the zone lookup alone, on :8091"
 	@echo "  make info        what is in the build right now"
 	@echo "  make regions     what Geofabrik publishes"
 	@echo "  make clean       delete $(DUCKDB) $(PMTILES) $(LOG), keep $(PBF)"
@@ -247,3 +276,5 @@ help:
 	    else printf "  [ ] %-46s %s\n" "$$n" "pending"; fi; done
 	@if [ -n "$$(ls -1 $(PMTILES)/*.pmtiles 2>/dev/null)" ]; then printf "  [x] %-46s %s\n" "$(PMTILES)/" "$$(du -sh $(PMTILES) | cut -f1), $$(ls -1 $(PMTILES)/*.pmtiles | wc -l) layers"; \
 	 else printf "  [ ] %-46s %s\n" "$(PMTILES)/" "pending"; fi
+	@if [ -e "$(ANON)" ]; then printf "  [x] %-46s %s\n" "$(ANON)" "$$(du -h $(ANON) | cut -f1)"; \
+	 else printf "  [ ] %-46s %s\n" "$(ANON)" "optional -- make anon"; fi

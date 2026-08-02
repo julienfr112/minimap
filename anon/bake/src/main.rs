@@ -7,7 +7,7 @@
 //! what the result guarantees and why it is a cut curve rather than a quadtree.
 //!
 //!   anon-bake                                  # defaults, whole database
-//!   anon-bake --k 16,64,256 --level 18
+//!   anon-bake --k 16,64,256 --level 19
 //!   anon-bake --bbox 1.7 49.7 2.7 50.1         # one region, for a quick look
 //!
 //! ## What counts as a building
@@ -28,11 +28,18 @@ use std::time::Instant;
 use anon_format::{self as fmt, Record};
 use rayon::slice::ParallelSliceMut;
 
-/// Grid the zones are cut on. Cells are `2^LEVEL` to a world side: at z18 that
-/// is 153 m at the equator and 102 m at Amiens, which sets the finest a zone can
-/// possibly be. Going finer costs a bigger sort for resolution no privacy
-/// argument wants -- a 25 m zone is a building.
-const LEVEL: u32 = 18;
+/// Grid the zones are cut on. Cells are `2^LEVEL` to a world side: at z19 that
+/// is 76 m at the equator and 50 m in Paris, which sets the finest a zone can
+/// possibly be -- still two or three buildings wide in the densest fabric, so
+/// no cell names a building on its own.
+///
+/// z19 rather than z18 because the grid quantises the *shape*: a dense-city
+/// zone of k buildings is only as round as its cell count allows, and a 6-cell
+/// zone (k=64 in Paris at z18) cannot help being a ribbon. At z19 the same
+/// zone is ~22 cells and packs to within ~20% of what its density strictly
+/// requires. Going finer again (z20, 25 m) is a bigger sort for cells the size
+/// of a single building, which no privacy argument wants.
+const LEVEL: u32 = 19;
 
 /// The privacy ladder, in buildings per zone. Roughly: a few blocks, a
 /// neighbourhood, a district. Baking several is cheap and means the operator can
@@ -141,7 +148,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut tiers = Vec::new();
     for &k in &args.tiers {
         let t0 = Instant::now();
-        let zones = fmt::cut(&cells, k);
+        let zones = fmt::cut(args.level, &cells, k);
         timed(format!("k={k}: {} zones", commas(zones.len() as u64)), t0);
         // The table the operator actually decides on: what k buys, by the kind of
         // place it is bought in. A single median over all zones hides the whole
@@ -387,8 +394,9 @@ impl Args {
             .expect("anon/bake/ has two parents")
             .to_path_buf();
         let mut out = Args {
-            // Both live under build/, because both are generated: `make clean`
-            // has to be able to take them away with everything else.
+            // Both defaults are `make`'s own paths: the database where the
+            // pipeline writes it, the index where `make anon`, `make serve` and
+            // `make clean` all expect it (and .gitignore already lists it).
             db: std::env::var("MINIMAP_DB")
                 .map(Into::into)
                 .unwrap_or_else(|_| root.join("duckdb/minimap.duckdb")),
@@ -403,6 +411,27 @@ impl Args {
             let mut next =
                 || -> Result<String, String> { args.next().ok_or(format!("{flag} needs a value")) };
             match flag.as_str() {
+                "--help" | "-h" => {
+                    println!(
+                        "anon-bake -- cut the world into zones of k buildings (see anon/README.md)
+
+  --db PATH            the pipeline database (default {}, or $MINIMAP_DB)
+  --out PATH           where to write the index (default {})
+  --k LIST             tiers to bake, comma separated (default {})
+  --level Z            grid the zones are cut on (default {LEVEL})
+  --bbox W S E N       only buildings inside a lon/lat box, for a quick look
+  --min-footprint M2   drop buildings smaller than M2 square metres -- the
+                       sheds and barns that inflate a hamlet's count",
+                        out.db.display(),
+                        out.out.display(),
+                        TIERS
+                            .iter()
+                            .map(u32::to_string)
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    );
+                    std::process::exit(0);
+                }
                 "--db" => out.db = next()?.into(),
                 "--out" => out.out = next()?.into(),
                 "--level" => out.level = next()?.parse()?,
@@ -421,7 +450,7 @@ impl Args {
                     }
                     out.bbox = Some(v);
                 }
-                other => return Err(format!("unknown flag {other}").into()),
+                other => return Err(format!("unknown flag {other} -- try --help").into()),
             }
         }
         // The upper bound keeps the Hilbert key inside 48 bits; the lower one is

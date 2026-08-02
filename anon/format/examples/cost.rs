@@ -26,7 +26,7 @@ fn main() {
         });
     }
 
-    let zones = anon_format::cut(&bins, 64);
+    let zones = anon_format::cut(level, &bins, 64);
     let n = zones.len();
     let bounds = [-180.0, -85.0, 180.0, 85.0];
     let bytes = anon_format::encode(level, 64, bounds, &[(64, zones)]).unwrap();
