@@ -588,7 +588,7 @@ class Minimap {
   // mode instead: rasterising newly exposed ground is exactly the hitch a drag
   // must not have, and the frame after the pointer comes up redraws it properly.
   #paint(tile, names) {
-    const rk = `${tile.key}|${names.join('+')}@${this.zoom}`;
+    const rk = `${tile.key}|${[...tile.layers.keys()].join('+')}@${this.zoom}`;
     let bmp = this.rasters.get(rk);
     if (!bmp) {
       if (this.dragging) {
