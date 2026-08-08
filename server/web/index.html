@@ -42,6 +42,8 @@
   <div class="panel" id="help">drag to pan · scroll to zoom</div>
   <div class="panel" id="zone" hidden></div>
   <div class="panel" id="attribution"></div>
-  <script src="/minimap.js"></script>
+  <!-- Relative, so the same shell works at / and nested under a prefix; the
+       server guarantees the page URL ends in a slash. -->
+  <script src="minimap.js"></script>
 </body>
 </html>

@@ -107,7 +107,7 @@ BAKED    := $(DUCKDB)/.bake-$(REGION_ID)
 EXPORTED := $(PMTILES)/.export-$(REGION_ID)
 
 .DEFAULT_GOAL := help
-.PHONY: help all download europe load bake export anon serve anon-serve info sql regions clean distclean adopt dirs targets
+.PHONY: help all download europe load bake export anon serve anon-serve perf info sql regions prune clean distclean adopt dirs targets
 
 # --- the pipeline ----------------------------------------------------------
 # Each stage writes its own log via --log, rather than being piped through tee.
@@ -153,7 +153,13 @@ $(ANON): $(LOADED) $(wildcard anon/format/src/*.rs) $(wildcard anon/bake/src/*.r
 
 # --- using the result ------------------------------------------------------
 
-serve: $(EXPORTED)
+# Demand the pipeline only while the scaffolding to run it is there. After
+# `make prune` the database and its stamps are gone; without the guard, make
+# would see a missing $(BAKED) and drag a pruned machine into an hours-long
+# rebuild just to serve archives it already has. No database means the
+# archives are the truth: serve them as they are.
+serve: $(if $(wildcard $(DB)),$(EXPORTED),)
+	@[ -n "$$(ls -1 $(PMTILES)/*.pmtiles 2>/dev/null)" ] || { echo "nothing to serve -- run: make all"; exit 1; }
 	@MINIMAP_TILES=$(PMTILES) MINIMAP_PORT=$(PORT) ANON_INDEX=$(ANON) ANON_K=$(ANON_K) \
 	  cargo run --release --quiet --bin minimap-backend
 
@@ -162,6 +168,23 @@ serve: $(EXPORTED)
 # proxy configuration it needs in front of it (in short: no request logging).
 anon-serve: $(ANON)
 	@ANON_INDEX=$(ANON) ANON_K=$(ANON_K) cargo run --release --quiet -p anon-serve
+
+# What the server's caches cost: leaf-directory hits, etag revalidation, and
+# RSS under sustained load. See server/tests/cache_perf.rs.
+#
+# It builds its own archives, so it needs nothing from the pipeline and runs
+# anywhere. TILES points it at real ones as well, which is the only way to see
+# what a miss costs when it is a page fault against a 15 GB file instead of a
+# gunzip against warm memory -- and it will pull GBs through the page cache.
+#
+#   make perf
+#   make perf SCALE=10             ten times the iterations
+#   make perf TILES=$(PMTILES)   ... and the archives that shipped
+SCALE ?= 1
+TILES ?=
+perf:
+	@$(if $(TILES),MINIMAP_TILES=$(abspath $(TILES)) ,)MINIMAP_PERF_SCALE=$(SCALE) \
+	  cargo test --release -p minimap-server --test cache_perf -- --nocapture
 
 info:
 	@$(MINIMAP) info $(COMMON)
@@ -185,6 +208,17 @@ dirs:
 # The asymmetry is the point. $(DUCKDB) and $(PMTILES) are a pure function of
 # $(PBF) and the settings above, so throwing them away costs only CPU. $(PBF)
 # costs someone else's bandwidth, so it takes a second, explicit ask.
+
+# `prune` is for the machine that built the map and now only serves it. The
+# database is pure scaffolding once the archives exist -- 154 GB standing in
+# for 135 MB -- so throw it and the logs away and keep everything that ships:
+# $(PMTILES), $(ANON), and the downloads. `make serve` still works afterwards;
+# the next `make all` or `make anon` re-runs load, as it must.
+prune:
+	@for d in $(DUCKDB) $(LOG); do \
+	    if [ -d "$$d" ]; then echo "removing $$d ($$(du -sh $$d | cut -f1))"; rm -rf "$$d"; fi; \
+	done
+	@echo "kept $(PMTILES) ($$(du -sh $(PMTILES) 2>/dev/null | cut -f1 || echo 'nothing yet'))$(if $(wildcard $(ANON)), and $(ANON),) — still serves: make serve"
 
 clean:
 	@for d in $(DUCKDB) $(PMTILES) $(LOG); do \
@@ -245,8 +279,10 @@ help:
 	@echo "  make anon        cut k-anonymity zones from the database (see anon/)"
 	@echo "  make serve       serve it on :$(PORT) -- with click-for-a-zone if anon ran"
 	@echo "  make anon-serve  the zone lookup alone, on :8091"
+	@echo "  make perf        what the server's caches cost -- see server/tests/"
 	@echo "  make info        what is in the build right now"
 	@echo "  make regions     what Geofabrik publishes"
+	@echo "  make prune       delete the scaffolding ($(DUCKDB) $(LOG)), keep the deliverable"
 	@echo "  make clean       delete $(DUCKDB) $(PMTILES) $(LOG), keep $(PBF)"
 	@echo "  make distclean   delete the downloads too (asks first)"
 	@echo "  make adopt       move pre-existing artefacts into this layout"

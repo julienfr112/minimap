@@ -21,14 +21,13 @@ never needs DuckDB, the extracts, or anything else the pipeline wanted:
 | `anon/anon-zones.bin` | 70 MB | `make anon` |
 | `server/web/` — `index.html`, `minimap.js` | 40 kB | in the repo |
 
-Code, and here the two halves differ:
+Code — and both halves are libraries, so nothing here is copied:
 
-* **`anon-format` is a library** — the ~450 dependency-free lines under
-  `anon/format/`. Depend on it directly.
-* **This crate is a binary**, so its two reusable pieces are copied, not
-  imported: `src/pmtiles.rs` (the archive reader, ~250 lines, wants `memmap2`
-  and `flate2`) and the handlers in `src/main.rs` (`tile`, `meta_json`, and
-  the `/zone` trio, ~250 lines between them).
+* **`anon-format`** — the ~450 dependency-free lines under `anon/format/`.
+* **this crate** — `src/lib.rs` is the server (paths in, an axum `Router` out);
+  `src/main.rs` is that library plus an environment and a listen address.
+  `src/pmtiles.rs` is public too, for a host that wants the archive reader and
+  none of the HTTP.
 
 Everything below assumes the artifacts sit somewhere on the host's disk and
 get there by `scp` or the deploy pipeline — copying `pmtiles/` *is* the
@@ -65,11 +64,70 @@ implementation in 200 lines, `zone()` in this crate's `main.rs` is the same
 thing with the quads added. Resident cost is what the kernel pages in — a few
 hundred bytes per query, whatever the index weighs.
 
-## The map alone
+## Both, nested
 
-Copy `src/pmtiles.rs`, open one `Archive` per `.pmtiles` file at startup (the
-loop at the top of `main()` here), and copy the `tile` and `meta_json`
-handlers. Two things in `tile` look incidental and are not:
+```toml
+minimap-server = { path = "…/minimap/server" }   # or a pinned git rev
+```
+
+```rust
+let opts = minimap_server::Options {
+    tiles: "/srv/pmtiles".into(),
+    web: "…/minimap/server/web".into(),
+    zones: Some("/srv/anon-zones.bin".into()),
+    k: Some(64),
+};
+app = app.nest("/map", minimap_server::MapServer::open(&opts)?.router());
+```
+
+`.router()` applies its own state, so nothing about the host's extractors or
+state type changes. The viewer's requests are all relative and the shell
+redirects to a trailing slash first, so `/map/` works without the viewer
+knowing it is nested.
+
+**`open` fails when there are no archives**, deliberately: a map server with no
+map is a misconfiguration. A host that wants to boot anyway — a test suite, a
+dev machine without the 29 GB — should treat the error as "no map today" and
+skip the `nest`, not paper over it inside the library.
+
+## The viewer as a component
+
+`web/minimap.js` is a page *and* a library. It publishes `window.Minimap`, and
+its own bootstrap only runs when the standalone shell is there (it looks for
+`#hud`), so a host application loads the same file, gets the class, and builds
+its own maps:
+
+```js
+const meta = await (await fetch('/map/meta.json')).json();
+const map = new Minimap(canvas, meta, { interactive: false, keyboard: false,
+                                        hash: false, query: false, anon: false });
+map.setView(48.8584, 2.2945, 15);
+map.boxes.push({ west, south, east, north, color: '#f00' });
+map.pins.push({ lat, lon, image: img, onclick: () => select(i) });
+map.dirty = true;
+```
+
+Every option defaults to what the standalone page does, and every one of them
+names a way the viewer reaches **outside its canvas** — which is exactly what
+is wrong in an embedding, and silently:
+
+| | off means |
+|---|---|
+| `interactive` | no pan, no wheel, no dblclick — a picture, not a control |
+| `keyboard` | no `window` keydown, so `-` typed in a form doesn't zoom |
+| `hash` | the URL fragment is the host's; don't read a view out of it |
+| `query` | `?maxzoom` is the host's query string, not a viewer flag |
+| `anon` | a click is not a `POST /zone` |
+
+`boxes` and `pins` are plain arrays drawn on top of everything else; mutate
+them and set `dirty = true`. A pin carries `{lat, lon, image, size?, anchor?,
+tint?, onclick?}` — `image` is anything `drawImage` takes, and a pin whose
+image has not decoded yet is skipped, so preload and mark dirty on `load`.
+Clicks hit-test against where pins were actually drawn, and a pin takes the
+click before the ground does.
+
+Two things in the tile route look incidental and are not, if a host is
+tempted to wrap it:
 
 * **`Content-Encoding: gzip`, pass-through.** Tiles are stored compressed and
   go to the client untouched. If the host app has a compression layer, exempt
@@ -78,32 +136,6 @@ handlers. Two things in `tile` look incidental and are not:
 * **The per-archive `ETag`.** Tiles never change within a build, so one etag
   per archive lets browsers skip re-downloading the map on every visit, and
   re-baking one layer does not invalidate the others.
-
-The viewer is two static files with no build step; serve `web/` from any
-static-file route.
-
-## Both, nested
-
-```rust
-let map_state = Arc::new(MapApp { layers, anon, web });
-let map = Router::new()
-    .route("/meta.json", get(meta_json))
-    .route("/tiles/{layer}/{z}/{x}/{y}", get(tile))
-    .route("/zone", get(zone_from_query).post(zone_from_body))
-    .fallback(get(asset))
-    .with_state(map_state);
-
-app = app.nest("/map", map);
-```
-
-`.with_state` on the nested router keeps its state separate from the host's,
-so nothing about the existing extractors changes.
-
-One caveat to nesting, currently: `minimap.js` fetches `/meta.json`,
-`/tiles/…` and `/zone` by absolute path, so under `/map` those requests miss
-the prefix. Until the viewer is made prefix-relative, either serve the three
-routes at the root alongside your app, or patch the three fetch calls when
-you copy `web/`.
 
 ## What the host application must not do
 
@@ -129,3 +161,39 @@ Everything is mmapped, so the host machine needs the disk and little else:
 the kernel keeps hot pages resident and a Europe-sized 29 GB map serves fine
 from a 1 GB VPS. See "Deploying on a small VPS" in the top-level README for
 the measured numbers.
+
+`make perf` measures the three things that stand between a request and its
+bytes — the leaf-directory cache, the etag, and the page cache — and prints a
+report rather than a verdict (`server/tests/cache_perf.rs`; it builds its own
+archives, so it needs nothing from the pipeline). On this laptop, against a
+synthetic 42 MB archive:
+
+| | |
+|---|---:|
+| leaf-directory miss (gunzip + parse) | ~10 µs |
+| leaf-directory hit | ~0.12 µs |
+| tile request through the router, 32 in flight | ~0.9 µs each |
+| the same request, one at a time | ~1.8 µs |
+| what a 304 saves over it | the body, plus ~0.2 µs |
+| RSS per request, steady state | 0 |
+
+Two of those numbers matter to an embedding:
+
+* **A hot tile does not scale across cores.** Every leaf hit takes the one
+  `Mutex` in `Archive`, so 16 threads on the same tile get ~4.3 M lookups/s
+  between them where one thread gets 19.6 M. It is 200 ns of lock, not a
+  problem at any traffic this serves — but it is the ceiling, and it is where
+  to look first if a host application ever finds one.
+* **A cold miss on a real archive is a page fault, not a gunzip.** Against the
+  15 GB `roads.pmtiles`, randomly-sampled tiles cost ~780 µs cold and ~1.8 µs
+  warm, and the walk made ~700 kB resident per tile served — a tile's own
+  bytes, the leaf it lives in, and the kernel's read-ahead around both. All of
+  it evictable, which is the whole reason the archive may be larger than the
+  machine. `make perf TILES=pmtiles` reproduces it, and pulls those GB through
+  the page cache to do so.
+
+Invalidation is asserted rather than measured, because it is a design
+property: the etag is the archive's size and mtime read once at open, so a
+re-baked layer invalidates that layer and no other, and a deploy that swaps
+a file needs the process bounced — which is the same restart the mmap
+contract above already requires.

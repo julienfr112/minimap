@@ -1051,14 +1051,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "minimap-backend"
+name = "minimap-server"
 version = "0.1.0"
 dependencies = [
  "anon-format",
  "axum",
  "flate2",
+ "http-body-util",
  "memmap2 0.9.11",
  "tokio",
+ "tower",
 ]
 
 [[package]]

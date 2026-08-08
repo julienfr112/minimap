@@ -1,7 +1,15 @@
 [package]
-name = "minimap-backend"
+name = "minimap-server"
 version = "0.1.0"
 edition = "2021"
+
+# A library with a thin binary on top. The library is the server -- paths in,
+# an axum Router out -- so another application can mount the map under a nest
+# of its own router with one dependency. The binary is the standalone stance:
+# it reads the environment, picks the defaults, and listens.
+[[bin]]
+name = "minimap-backend"
+path = "src/main.rs"
 
 [dependencies]
 # The anonymity zones (see anon/README.md) ride along in the same process: the
@@ -18,3 +26,10 @@ memmap2 = "0.9"
 # Only used to inflate the directory sections. Tiles are passed through still
 # gzipped, so nothing decompresses them here.
 flate2 = "1"
+
+# Only tests/cache_perf.rs, which drives the router directly rather than over a
+# socket -- a perf number should measure the cache, not the loopback. Both are
+# already in the tree as axum's own dependencies, so this adds nothing to build.
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

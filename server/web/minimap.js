@@ -278,17 +278,37 @@ function unproject(x, y) {
 
 // -------------------------------------------------------------------- map
 
+/// What a viewer does beyond drawing, and every one of them defaults to what
+/// the standalone page has always done. They exist because the same class now
+/// also runs as a *component* -- a small box inside a larger application, of
+/// which there may be two on one page -- and every one of these behaviours is
+/// wrong there for the same reason: it reaches outside the canvas.
+///
+/// `keyboard` and `hash` touch `window` and the URL, which belong to the host
+/// page; `interactive` decides whether the box is a control or a picture;
+/// `query` reads `?maxzoom`, which under an embedding is somebody else's query
+/// string; `anon` turns a click into a POST, which a host that never asked for
+/// the zone endpoint should not be making.
+const DEFAULTS = {
+  interactive: true,
+  keyboard: true,
+  hash: true,
+  query: true,
+  anon: true,
+};
+
 class Minimap {
-  constructor(canvas, meta) {
+  constructor(canvas, meta, opts = {}) {
     this.canvas = canvas;
     this.ctx = canvas.getContext('2d');
     this.meta = meta;
+    this.opts = { ...DEFAULTS, ...opts };
     this.minzoom = meta.minzoom;
     // `?maxzoom=N` pretends the archive stops at N, overzooming from there.
     // Worth having because the deepest zoom is most of the archive -- z15 is
     // 44% of France -- so this answers "what would I lose by not baking it"
     // without rebuilding anything.
-    const cap = +new URLSearchParams(location.search).get('maxzoom');
+    const cap = this.opts.query ? +new URLSearchParams(location.search).get('maxzoom') : 0;
     this.maxzoom = cap ? Math.min(meta.maxzoom, cap) : meta.maxzoom;
     // Each layer is its own archive with its own zoom rungs, and the server says
     // which. `land` stops where the background cap put it; `buildings` start
@@ -333,15 +353,23 @@ class Minimap {
     this.center = { lon: meta.center[0], lat: meta.center[1] };
 
     // #zoom/lat/lon in the URL wins, so a view can be linked to directly.
-    const hash = location.hash.match(/^#(\d+(?:\.\d+)?)\/(-?\d+\.?\d*)\/(-?\d+\.?\d*)/);
+    const hash = this.opts.hash
+      && location.hash.match(/^#(\d+(?:\.\d+)?)\/(-?\d+\.?\d*)\/(-?\d+\.?\d*)/);
     if (hash) {
       this.zoom = this.#snap(+hash[1]);
       this.center = { lon: +hash[3], lat: +hash[2] };
     }
     // Whether the server can answer /zone, from meta.json -- and the last
     // answer it gave, drawn as an overlay until Escape or a new click.
-    this.anon = meta.anon ?? null;
+    this.anon = this.opts.anon ? meta.anon ?? null : null;
     this.zone = null;
+    // Geographic overlays the host draws on top of the map: `boxes` are
+    // lon/lat rectangles, `pins` are points carrying an image. Both are plain
+    // arrays, mutated in place by whoever owns the map -- there is no add/remove
+    // API because there is no state to keep in step, only `dirty = true` after.
+    // See #drawOverlays for what a member of each looks like.
+    this.boxes = [];
+    this.pins = [];
     this.tiles = new Map(); // "z/x/y" -> layers | 'loading' | 'empty'  (see #keep)
     this.rasters = new Map(); // "z/x/y|layers@zoom" -> canvas  (see #paint)
     this.rasterBytes = 0;
@@ -377,6 +405,43 @@ class Minimap {
     this.dirty = true;
   }
 
+  // Point the map at a place. The zoom is snapped, so a caller asking for a
+  // level this archive has no rung for gets the nearest one it does rather
+  // than a view with no tiles -- which is the whole reason this is a method
+  // and not two field assignments.
+  setView(lat, lon, zoom) {
+    this.center = { lon, lat };
+    if (zoom != null) this.zoom = this.#snap(zoom);
+    this.dirty = true;
+  }
+
+  // Centre on a lon/lat box and pick the deepest stop that still shows all of
+  // it, with `pad` CSS pixels of margin. Used for "here is the meeting square,
+  // and here is you, 3 km outside it" -- a view that has to frame two things
+  // whose separation is not known until it happens.
+  //
+  // A box larger than the shallowest stop can show still returns that stop:
+  // there is no wider tile to fall back to, so the honest answer is the widest
+  // view that exists rather than none.
+  fit(west, south, east, north, pad = 24) {
+    const [x0, y0] = project(west, north);
+    const [x1, y1] = project(east, south);
+    // The centre in projected space, not the mean of the latitudes: Mercator
+    // is not linear in latitude, so averaging lat/lon directly puts a tall box
+    // off centre by more the further from the equator it is.
+    const [lon, lat] = unproject((x0 + x1) / 2, (y0 + y1) / 2);
+    this.center = { lon, lat };
+    const w = Math.max(x1 - x0, 1e-9);
+    const h = Math.max(y1 - y0, 1e-9);
+    let best = this.stops[0];
+    for (const z of this.stops) {
+      const world = TILE * 2 ** z;
+      if (w * world <= this.w - 2 * pad && h * world <= this.h - 2 * pad) best = z;
+    }
+    this.zoom = best;
+    this.dirty = true;
+  }
+
   resize() {
     const dpr = window.devicePixelRatio || 1;
     const { clientWidth: w, clientHeight: h } = this.canvas;
@@ -399,8 +464,13 @@ class Minimap {
     window.addEventListener('resize', () => this.resize());
 
     let lastX = 0, lastY = 0, downX = 0, downY = 0;
+    // A click is answered whether or not the map pans: a picture of a square
+    // with pins on it is still something you can click a pin on. Only the
+    // *panning* half is gated on `interactive`.
     this.canvas.addEventListener('pointerdown', (e) => {
-      this.dragging = true; lastX = downX = e.clientX; lastY = downY = e.clientY;
+      downX = lastX = e.clientX; downY = lastY = e.clientY;
+      if (!this.opts.interactive) return;
+      this.dragging = true;
       this.canvas.setPointerCapture(e.pointerId);
       this.canvas.style.cursor = 'grabbing';
     });
@@ -413,14 +483,20 @@ class Minimap {
     // that rasterises whatever the drag exposed and puts the casings back.
     const stop = () => {
       this.dragging = false;
-      this.canvas.style.cursor = 'grab';
+      if (this.opts.interactive) this.canvas.style.cursor = 'grab';
       this.dirty = true;
     };
     this.canvas.addEventListener('pointerup', (e) => {
       stop();
-      if (Math.hypot(e.clientX - downX, e.clientY - downY) < CLICK_SLOP) this.#pick(e);
+      if (Math.hypot(e.clientX - downX, e.clientY - downY) >= CLICK_SLOP) return;
+      // A pin under the pointer takes the click; only ground reaches #pick.
+      // Otherwise selecting a search result would also ask what zone it is in.
+      if (this.#hitPin(e)) return;
+      this.#pick(e);
     });
     this.canvas.addEventListener('pointercancel', stop);
+
+    if (!this.opts.interactive) return;
 
     // Wheel deltas are reported in three different units depending on the
     // browser and the device; normalise to pixels before counting them.
@@ -446,6 +522,10 @@ class Minimap {
         e.clientX - rect.left - this.w / 2, e.clientY - rect.top - this.h / 2);
     });
 
+    // Bound on `window`, so it is the one listener that a second map on the
+    // page -- or a text input anywhere on it -- would fight over. A component
+    // leaves it off: `-` typed into a chat box must not zoom a map out.
+    if (!this.opts.keyboard) return;
     window.addEventListener('keydown', (e) => {
       if (e.key === '+' || e.key === '=') this.#zoomBy(1);
       else if (e.key === '-' || e.key === '_') this.#zoomBy(-1);
@@ -453,6 +533,36 @@ class Minimap {
       else return;
       e.preventDefault();
     });
+  }
+
+  // Where a pointer event is, in lon/lat.
+  #eventLonLat(e) {
+    const rect = this.canvas.getBoundingClientRect();
+    const world = TILE * 2 ** this.zoom;
+    const c = project(this.center.lon, this.center.lat);
+    return unproject(
+      c[0] + (e.clientX - rect.left - this.w / 2) / world,
+      c[1] + (e.clientY - rect.top - this.h / 2) / world,
+    );
+  }
+
+  // The topmost pin whose box contains the pointer, called for its side effect.
+  // Reverse order, so the pin drawn last -- the one visibly on top where two
+  // overlap -- is the one that answers.
+  #hitPin(e) {
+    const rect = this.canvas.getBoundingClientRect();
+    const px = e.clientX - rect.left, py = e.clientY - rect.top;
+    for (let i = this.pins.length - 1; i >= 0; i--) {
+      const pin = this.pins[i];
+      if (!pin.onclick || !pin.at) continue;
+      const [w, h] = pin.size ?? [32, 32];
+      const [ax, ay] = pin.anchor ?? [w / 2, h];
+      if (px < pin.at[0] - ax || px > pin.at[0] - ax + w) continue;
+      if (py < pin.at[1] - ay || py > pin.at[1] - ay + h) continue;
+      pin.onclick(pin, i);
+      return true;
+    }
+    return false;
   }
 
   // Ask the server which anon zone stands in for the clicked point, and keep
@@ -465,14 +575,8 @@ class Minimap {
   // function of the zone alone).
   #pick(e) {
     if (!this.anon) return;
-    const rect = this.canvas.getBoundingClientRect();
-    const world = TILE * 2 ** this.zoom;
-    const c = project(this.center.lon, this.center.lat);
-    const [lon, lat] = unproject(
-      c[0] + (e.clientX - rect.left - this.w / 2) / world,
-      c[1] + (e.clientY - rect.top - this.h / 2) / world,
-    );
-    fetch('/zone', {
+    const [lon, lat] = this.#eventLonLat(e);
+    fetch('zone', {
       method: 'POST',
       headers: { 'content-type': 'application/x-www-form-urlencoded' },
       body: `lat=${lat.toFixed(6)}&lon=${lon.toFixed(6)}`,
@@ -518,7 +622,10 @@ class Minimap {
     if (hit !== undefined) return hit === 'loading' || hit === 'empty' ? null : hit;
     this.tiles.set(key, 'loading');
     this.pending++;
-    fetch(`/tiles/${name}/${z}/${x}/${y}`)
+    // Relative, like every request this file makes: the server redirects the
+    // shell to a trailing-slash URL, so these resolve correctly whether the
+    // map lives at / or nested under /map/ of some larger application.
+    fetch(`tiles/${name}/${z}/${x}/${y}`)
       .then((r) => {
         if (r.status === 204 || r.status === 404) return null;
         if (!r.ok) throw new Error(`${r.status}`);
@@ -633,8 +740,63 @@ class Minimap {
     this.#identity();
     this.#drawLabels(labelled);
     this.#drawZone(world, originX, originY);
+    this.#drawOverlays(world, originX, originY);
 
     onStatus(this);
+  }
+
+  // The host's own geography, on top of everything the archive drew.
+  //
+  //   boxes: { west, south, east, north, color?, fill?, width? }
+  //   pins:  { lat, lon, image, size?, anchor?, onclick?, tint? }
+  //
+  // `image` is anything drawImage takes -- an <img> the host preloaded is the
+  // expected case. A pin whose image has not decoded yet is skipped rather
+  // than queued: images fire `load`, the host marks the map dirty, and the
+  // next frame has it. That is why there is no image cache here.
+  //
+  // Each pin's screen position is written back to `pin.at` as it is drawn,
+  // which is what #hitPin reads. Hit-testing therefore agrees with the drawing
+  // by construction -- it cannot go stale against a pan, because a pan redraws.
+  #drawOverlays(world, originX, originY) {
+    if (!this.boxes.length && !this.pins.length) return;
+    const ctx = this.ctx;
+    const px = (lon, lat) => {
+      const p = project(lon, lat);
+      return [p[0] * world - originX, p[1] * world - originY];
+    };
+
+    for (const b of this.boxes) {
+      const [x0, y0] = px(b.west, b.north);
+      const [x1, y1] = px(b.east, b.south);
+      if (b.fill) {
+        ctx.fillStyle = b.fill;
+        ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
+      }
+      ctx.strokeStyle = b.color ?? '#f00';
+      ctx.lineWidth = b.width ?? 1;
+      // Half-pixel offset: a 1px stroke on an integer coordinate straddles two
+      // device rows and comes out as a 2px grey line.
+      ctx.strokeRect(
+        Math.round(x0) + 0.5, Math.round(y0) + 0.5,
+        Math.round(x1 - x0) - 1, Math.round(y1 - y0) - 1,
+      );
+    }
+
+    for (const pin of this.pins) {
+      if (pin.lat == null || pin.lon == null) { pin.at = null; continue; }
+      const [x, y] = px(pin.lon, pin.lat);
+      pin.at = [x, y];
+      const img = pin.image;
+      if (!img || !(img.complete ?? true) || !(img.naturalWidth ?? 1)) continue;
+      const [w, h] = pin.size ?? [32, 32];
+      const [ax, ay] = pin.anchor ?? [w / 2, h];
+      // `filter` is how a pin is highlighted without a second asset -- the same
+      // hue rotation the CSS class used to do, applied to the one image.
+      if (pin.tint) ctx.filter = pin.tint;
+      ctx.drawImage(img, x - ax, y - ay, w, h);
+      if (pin.tint) ctx.filter = 'none';
+    }
   }
 
   // The anon zone overlay: the zone's cells filled, and a dot on the clicked
@@ -943,7 +1105,7 @@ let onStatus = () => {};
 let onZone = () => {};
 
 async function main() {
-  const meta = await (await fetch('/meta.json')).json();
+  const meta = await (await fetch('meta.json')).json();
   const canvas = document.getElementById('map');
   const map = new Minimap(canvas, meta);
 
@@ -982,7 +1144,18 @@ async function main() {
   window.map = map; // handy in the console
 }
 
-main().catch((e) => {
-  document.getElementById('hud').textContent = 'error: ' + e.message;
-  console.error(e);
-});
+// The class is the library; `main` is the standalone page built on it. Another
+// application loads this same file, finds no shell to boot, and constructs its
+// own maps -- which is why every reach outside the canvas above is an option.
+window.Minimap = Minimap;
+window.minimapProject = project;
+window.minimapUnproject = unproject;
+
+// `#hud` rather than `#map`: an embedding may well have a canvas of its own by
+// that id (and the shell's ids are the ones `main` actually needs).
+if (document.getElementById('hud')) {
+  main().catch((e) => {
+    document.getElementById('hud').textContent = 'error: ' + e.message;
+    console.error(e);
+  });
+}
