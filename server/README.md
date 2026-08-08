@@ -136,7 +136,7 @@ else; mutate them and set `dirty = true`.
   metres**, which is why it is a primitive here and not something a host draws:
   it has to be re-derived from the zoom every frame. This is the shape for
   "somewhere within R of here", i.e. for a `/zone` answer.
-* `{lat, lon, image, size?, anchor?, tint?, onclick?}` — `image` is anything
+* `{lat, lon, image, size?, anchor?, onclick?}` — `image` is anything
   `drawImage` takes, and a pin whose image has not decoded yet is skipped, so
   preload it and mark the map dirty on `load`.
 

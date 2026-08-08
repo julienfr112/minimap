@@ -258,6 +258,9 @@ const ZONE_EDGE = 'rgba(192, 57, 43, 0.85)';
 // press-and-release that travelled less than this many pixels.
 const CLICK_SLOP = 4;
 
+// Margin left around whatever `fit` was asked to frame, in CSS pixels.
+const FIT_PAD = 24;
+
 // Roads get thicker as you zoom in, but sub-linearly.
 function widthScale(zoom) { return 1.6 * 2 ** ((zoom - 10) / 2.4); }
 
@@ -451,14 +454,14 @@ class Minimap {
   }
 
   // Centre on a lon/lat box and pick the deepest stop that still shows all of
-  // it, with `pad` CSS pixels of margin. Used for "here is the meeting square,
+  // it, with a margin. Used for "here is the meeting square,
   // and here is you, 3 km outside it" -- a view that has to frame two things
   // whose separation is not known until it happens.
   //
   // A box larger than the shallowest stop can show still returns that stop:
   // there is no wider tile to fall back to, so the honest answer is the widest
   // view that exists rather than none.
-  fit(west, south, east, north, pad = 24) {
+  fit(west, south, east, north) {
     const [x0, y0] = project(west, north);
     const [x1, y1] = project(east, south);
     // The centre in projected space, not the mean of the latitudes: Mercator
@@ -471,7 +474,7 @@ class Minimap {
     let best = this.stops[0];
     for (const z of this.stops) {
       const world = TILE * 2 ** z;
-      if (w * world <= this.w - 2 * pad && h * world <= this.h - 2 * pad) best = z;
+      if (w * world <= this.w - 2 * FIT_PAD && h * world <= this.h - 2 * FIT_PAD) best = z;
     }
     this.zoom = best;
     this.dirty = true;
@@ -801,7 +804,7 @@ class Minimap {
   //
   //   boxes:   { west, south, east, north, color?, fill?, width? }
   //   circles: { lat, lon, radius_m, color?, fill?, width?, onclick? }
-  //   pins:    { lat, lon, image, size?, anchor?, onclick?, tint? }
+  //   pins:    { lat, lon, image, size?, anchor?, onclick? }
   //
   // A circle's radius is in *metres*, not pixels, which is the whole reason it
   // is a primitive here rather than something a host draws itself: it has to be
@@ -869,11 +872,7 @@ class Minimap {
       if (!img || !(img.complete ?? true) || !(img.naturalWidth ?? 1)) continue;
       const [w, h] = pin.size ?? [32, 32];
       const [ax, ay] = pin.anchor ?? [w / 2, h];
-      // `filter` is how a pin is highlighted without a second asset -- the same
-      // hue rotation the CSS class used to do, applied to the one image.
-      if (pin.tint) ctx.filter = pin.tint;
       ctx.drawImage(img, x - ax, y - ay, w, h);
-      if (pin.tint) ctx.filter = 'none';
     }
   }
 
