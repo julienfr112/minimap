@@ -147,10 +147,13 @@ function decodeGeometry(bytes) {
 // config::LAND_URL). The land layer then paints paper back over the continent.
 //
 // Against an archive with no `land` layer, SEA would instead paint the whole of
-// Europe blue and leave the roads floating on it, so this follows the archive.
+// Europe blue and leave the roads floating on it, so this follows the archive
+// -- see `this.background`, decided per viewer from the layers the server
+// offers. An embedding running with no archives at all hits the same case, and
+// wants paper: a box that is entirely sea says "the ocean", where a blank one
+// says "no map here", which is the truth.
 const PAPER = '#f6f4ef';
 const SEA = '#c3d9e8';
-const BACKGROUND = SEA;
 
 // Which levels exist is an archive fact, not a viewer preference, so it arrives
 // per layer in /meta.json. Guessing means requesting tiles that were never
@@ -340,6 +343,8 @@ class Minimap {
         this.layerRungs.set(name, FALLBACK_LEVELS.filter((z) => z <= this.maxzoom));
       }
     }
+    // Sea is only the right ground where something paints land back over it.
+    this.background = this.layerRungs.has('land') ? SEA : PAPER;
     // Every rung any layer has, which is what the zoom stops span.
     this.levels = [...new Set([...this.layerRungs.values()].flat())].sort((a, b) => a - b);
     // Every zoom the viewer will settle on, shallowest first. Zoom is discrete
@@ -717,7 +722,7 @@ class Minimap {
     // The passes below leave the canvas in some tile's coordinate space, so the
     // background and the labels each reset it first.
     this.#identity();
-    ctx.fillStyle = BACKGROUND;
+    ctx.fillStyle = this.background;
     ctx.fillRect(0, 0, this.w, this.h);
 
     const world = TILE * 2 ** this.zoom;
