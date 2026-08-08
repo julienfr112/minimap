@@ -107,7 +107,7 @@ BAKED    := $(DUCKDB)/.bake-$(REGION_ID)
 EXPORTED := $(PMTILES)/.export-$(REGION_ID)
 
 .DEFAULT_GOAL := help
-.PHONY: help all download europe load bake export anon serve anon-serve perf info sql regions prune clean distclean adopt dirs targets
+.PHONY: help all download europe load bake export anon serve anon-serve perf working-set info sql regions prune clean distclean adopt dirs targets
 
 # --- the pipeline ----------------------------------------------------------
 # Each stage writes its own log via --log, rather than being piped through tee.
@@ -185,6 +185,19 @@ TILES ?=
 perf:
 	@$(if $(TILES),MINIMAP_TILES=$(abspath $(TILES)) ,)MINIMAP_PERF_SCALE=$(SCALE) \
 	  cargo test --release -p minimap-server --test cache_perf -- --nocapture
+
+# How much of the archive has to stay in RAM, given that traffic lands on city
+# centres rather than spreading over the map. This is what sizes a box: the
+# tiles people look at are a tiny fraction of what shipped, and `perf` above
+# says what it costs when they are resident and when they are not.
+#
+#   make working-set
+#   make working-set WHERE="Paris Berlin"          only these
+#   make working-set WHERE="35.68,139.69,Tokyo"    a centre the list lacks
+WHERE ?=
+working-set: | dirs
+	@cargo run --release --quiet -p minimap-server --example working-set -- \
+	  $(PMTILES) $(WHERE)
 
 info:
 	@$(MINIMAP) info $(COMMON)
@@ -280,6 +293,7 @@ help:
 	@echo "  make serve       serve it on :$(PORT) -- with click-for-a-zone if anon ran"
 	@echo "  make anon-serve  the zone lookup alone, on :8091"
 	@echo "  make perf        what the server's caches cost -- see server/tests/"
+	@echo "  make working-set how much of the archive has to stay in RAM"
 	@echo "  make info        what is in the build right now"
 	@echo "  make regions     what Geofabrik publishes"
 	@echo "  make prune       delete the scaffolding ($(DUCKDB) $(LOG)), keep the deliverable"

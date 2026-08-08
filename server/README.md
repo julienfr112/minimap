@@ -206,3 +206,18 @@ property: the etag is the archive's size and mtime read once at open, so a
 re-baked layer invalidates that layer and no other, and a deploy that swaps
 a file needs the process bounced — which is the same restart the mmap
 contract above already requires.
+
+## Sizing the host
+
+Neither of those numbers sizes a machine on its own. What does is how much of
+the archive stays resident, and that is a question about *traffic*, not about
+the archive: people look at city centres, so the hot set is a small fraction of
+what shipped. `make working-set` measures the fraction — for Europe, 2.5 GB of
+a 27 GB archive covers 24 capitals and every shallow rung, which is why 8 GB is
+comfortable and why the same box would struggle if the same requests were
+spread evenly over the map.
+
+An embedded viewer costs the host ~140 kB on first paint, ~30–50 kB per pan,
+and nothing at all while it sits on screen — there is no session, no polling
+and no socket to hold open, so idle users are genuinely free. "How many users a
+small box holds" in the top-level README works this through to a number.

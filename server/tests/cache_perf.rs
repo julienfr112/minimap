@@ -261,26 +261,30 @@ fn contention(fx: &Fixture, scale: f64) {
         println!("  {name}");
         let mut baseline = 0.0;
         for &t in &threads {
-            let done = AtomicU64::new(0);
             let start = Instant::now();
-            std::thread::scope(|s| {
-                for tid in 0..t {
-                    let done = &done;
-                    let tiles = &fx.tiles;
-                    s.spawn(move || {
-                        let mut rng = Rng::new(tid as u64 + 1);
-                        let mut acc = 0u64;
-                        for _ in 0..per_thread {
-                            let (z, x, y) = if spread {
-                                tiles[rng.below(tiles.len())]
-                            } else {
-                                tiles[tiles.len() / 2]
-                            };
-                            acc += archive.tile(z, x, y).map_or(0, |b| b.len() as u64);
-                        }
-                        done.fetch_add(acc.min(1), Ordering::Relaxed);
-                    });
-                }
+            // Each thread returns the bytes it addressed: the sum is what stops
+            // the optimiser deciding the lookups had no effect, and a zero says
+            // the threads were measuring an archive full of misses.
+            let found: u64 = std::thread::scope(|s| {
+                let workers: Vec<_> = (0..t)
+                    .map(|tid| {
+                        let tiles = &fx.tiles;
+                        s.spawn(move || {
+                            let mut rng = Rng::new(tid as u64 + 1);
+                            let mut acc = 0u64;
+                            for _ in 0..per_thread {
+                                let (z, x, y) = if spread {
+                                    tiles[rng.below(tiles.len())]
+                                } else {
+                                    tiles[tiles.len() / 2]
+                                };
+                                acc += archive.tile(z, x, y).map_or(0, |b| b.len() as u64);
+                            }
+                            acc
+                        })
+                    })
+                    .collect();
+                workers.into_iter().map(|w| w.join().unwrap()).sum()
             });
             let d = start.elapsed();
             let ops = per_thread * t;
@@ -294,7 +298,7 @@ fn contention(fx: &Fixture, scale: f64) {
                 d.as_secs_f64() * 1e9 / ops as f64,
                 rate / baseline,
             );
-            assert!(done.load(Ordering::Relaxed) > 0, "every lookup missed");
+            assert!(found > 0, "every lookup missed -- the threads measured nothing");
         }
     }
     println!(

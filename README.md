@@ -567,6 +567,77 @@ disk with an OS. Three ways out, in increasing order of how much they solve:
   archive rebuilt monthly and never mutated, this is the best fit — and it makes
   the store-choice question above moot.
 
+### How many users a small box holds
+
+The sizing above asks what fits on the disk. What decides the box is what fits
+in *RAM*, and that depends on something the archive size cannot tell you:
+traffic lands on a few city centres, never evenly on the map.
+
+`make working-set` measures that, against a real build rather than a model. For
+a 27 GB Europe archive at rungs 10/12/15/17:
+
+| | |
+| --- | ---: |
+| every rung up to z12, all six layers — shared by everyone, everywhere | 2.12 GB |
+| 24 European capitals: z17 over 12×12 km plus z15 over 48×48 km | 435 MB |
+| **resident once every centre is warm** | **2.56 GB** |
+
+Paris is the worst single city at 41 MB. Across all 24, buildings are 61% of
+the city bytes and roads 36%, which is also the order to cap things in if it
+ever does not fit — the tool prints that split every time it runs. So a
+4-core, 8 GB box holds the whole hot set with ~5 GB to spare, and `make perf`
+says what that buys: **1.8 µs** for a warm tile against **714 µs** for one that
+reaches the disk.
+
+Concentration is doing all the work. Traffic spread evenly over Europe at z17
+would want all 27 GB resident, every request would miss, and the same box would
+serve two orders of magnitude fewer people. A map that everyone looks at in the
+same twenty cities is the easy case, and it is also the usual one.
+
+**What one viewer costs** — measured, except where noted:
+
+| | |
+| --- | ---: |
+| first screenful, cold browser | 64–255 kB, ~140 kB typical |
+| a pan or a zoom step | ~30–50 kB; the client keeps 400 decoded tiles |
+| a map on screen that nobody is touching | nothing — no session, no polling, no socket to hold |
+| a return visit inside 7 days | a few 304s (`max-age=604800`, one etag per archive) |
+
+**Where the ceiling is.** A warm tile is ~1.8 µs of work in this process;
+divide by 5–10 for the real network stack and four cores serve on the order of
+30–50k tiles/s, halved again if they also terminate TLS. Against that, the
+tiles/s per user below is the one estimated column — everything else here was
+measured:
+
+| behaviour | tiles/s each | 4 cores | 1 Gbit uplink | 100 Mbit uplink |
+| --- | ---: | ---: | ---: | ---: |
+| map open, occasional interaction | ~0.5 | 60 000+ | 100 000+ | ~20 000 |
+| browsing — a view change every ~8 s | ~4 | **8 000–12 000** | ~20 000 | **~2 000** |
+| continuous panning | ~45 | ~1 000 | ~2 700 | ~270 |
+
+So: a few thousand concurrently *interacting* users on four cores, and tens of
+thousands with the map merely on screen. On a gigabit link the HTTP layer is
+reached first; on 100 Mbit the uplink is the wall long before this server is.
+
+Three things bite before the tile path does:
+
+1. **Sockets, not tiles.** 4 000 browsers at ~6 HTTP/1.1 connections each is
+   24k sockets — raise `ulimit -n`, and prefer HTTP/2 so it is one connection
+   per user. Their kernel buffers are the only thing here that grows with user
+   count; the tile path itself measures **0 bytes of RSS per request** over
+   200 000 requests.
+2. **Cold start.** After a restart the first request to each city pays that
+   714 µs. It is survivable — a screenful is ~12 ms extra, spread over parallel
+   connections — but replay a list of city tiles at boot if the first minute
+   matters.
+3. **Storage.** All of this assumes local NVMe. On network-attached VPS disk a
+   cold tile is 5–10 ms, which turns warm-up from a wrinkle into a stall, and
+   makes the point above mandatory rather than optional.
+
+And the cheapest fix for all three, if the traffic ever justifies it: a CDN in
+front. Tiles are immutable within a build and already carry the etag and the
+week-long `max-age` that make caching them correct.
+
 ### Scaling to Europe
 
 The pipeline is region-agnostic (`make all REGIONS=europe`). Extraction *time* is no

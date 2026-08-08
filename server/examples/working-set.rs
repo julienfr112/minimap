@@ -6,8 +6,9 @@
 //! the map: it lands on a few dozen city centres, and those centres are a tiny
 //! fraction of a 29 GB archive. This measures that fraction.
 //!
-//!   cargo run --release -p minimap-server --example working-set -- pmtiles
-//!   ... [city ...]                only these, by name
+//!   make working-set
+//!   make working-set WHERE="Paris Berlin"        only these, by name
+//!   make working-set WHERE="35.68,139.69,Tokyo"  somewhere the list never heard of
 //!
 //! It sums the *stored* length of every tile in a box around each centre, at
 //! the rung the viewer would use there. Summing lengths reads directories and
@@ -48,7 +49,9 @@ const METRO_KM: f64 = 24.0;
 const SCREEN_TILES: usize = 7 * 5;
 
 /// Somewhere central in each city, and the point is the density, not the
-/// landmark. Cities outside the archive's bounds are skipped with a note.
+/// landmark. Cities outside the archive's bounds are skipped with a note. The
+/// list is European because the build usually is; anywhere else is a
+/// `lat,lon,Name` argument away.
 const CITIES: [(&str, f64, f64); 24] = [
     ("Paris", 48.857, 2.352),
     ("London", 51.507, -0.128),
@@ -79,7 +82,7 @@ const CITIES: [(&str, f64, f64); 24] = [
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let dir = PathBuf::from(args.next().unwrap_or_else(|| "pmtiles".into()));
-    let only: Vec<String> = args.map(|a| a.to_lowercase()).collect();
+    let places = places(args.collect())?;
 
     // One archive per layer, in whatever the build produced.
     let mut layers: BTreeMap<String, Archive> = BTreeMap::new();
@@ -96,10 +99,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("no .pmtiles in {}", dir.display()).into());
     }
 
-    let total: u64 = layers
-        .values()
-        .map(|a| a.tile_count)
-        .sum();
+    let total: u64 = layers.values().map(|a| a.tile_count).sum();
     println!(
         "{} layers, {} tiles: {}",
         layers.len(),
@@ -114,7 +114,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The shallow rungs are one working set for everybody: whoever loads the
     // map anywhere pulls them in, and they never leave.
     let mut shared = 0u64;
-    for (_, a) in layers.iter() {
+    for a in layers.values() {
         for z in a.min_zoom..=12.min(a.max_zoom) {
             shared += whole_rung(a, z);
         }
@@ -125,44 +125,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     println!(
-        "{:<12} {:>12} {:>12} {:>12}   {}",
+        "{:<12} {:>12} {:>12} {:>12}   first screenful at z{CITY_RUNG}",
         "city",
         format!("z{CITY_RUNG} {}x{} km", CITY_KM * 2.0, CITY_KM * 2.0),
         format!("z{METRO_RUNG} {}x{} km", METRO_KM * 2.0, METRO_KM * 2.0),
         "both",
-        "first screenful at z17"
     );
 
     let mut running = shared;
     let mut counted = 0usize;
-    for (name, lat, lon) in CITIES {
-        if !only.is_empty() && !only.contains(&name.to_lowercase()) {
-            continue;
-        }
+    // Which layer the city bytes went to, summed over every centre measured --
+    // the answer to "and what do I drop if it does not fit".
+    let mut per_layer: BTreeMap<&str, u64> = BTreeMap::new();
+    for (name, lat, lon) in &places {
         // A centre outside the build is not a gap in the report, it is a
         // country that was never downloaded.
         if !layers.values().any(|a| {
-            lon >= a.min_lon && lon <= a.max_lon && lat >= a.min_lat && lat <= a.max_lat
+            *lon >= a.min_lon && *lon <= a.max_lon && *lat >= a.min_lat && *lat <= a.max_lat
         }) {
             println!("{name:<12} outside the archive's bounds -- not in this build");
             continue;
         }
 
-        let city: u64 = layers
-            .values()
-            .map(|a| box_bytes(a, lat, lon, CITY_KM, CITY_RUNG))
-            .sum();
-        let metro: u64 = layers
-            .values()
-            .map(|a| box_bytes(a, lat, lon, METRO_KM, METRO_RUNG))
-            .sum();
-        // What a browser pulls when someone opens the map here cold: one
-        // screenful of every layer that reaches this rung, plus the background
-        // rungs it already shares with everyone.
-        let screen: u64 = layers
-            .values()
-            .map(|a| screenful(a, lat, lon, CITY_RUNG))
-            .sum();
+        let (mut city, mut metro, mut screen) = (0u64, 0u64, 0u64);
+        for (layer, a) in &layers {
+            let c = box_bytes(a, *lat, *lon, CITY_KM, CITY_RUNG);
+            let m = box_bytes(a, *lat, *lon, METRO_KM, METRO_RUNG);
+            // What a browser pulls when someone opens the map here cold: one
+            // screenful of every layer that reaches this rung, plus the
+            // background rungs it already shares with everyone.
+            screen += screenful(a, *lat, *lon, CITY_RUNG);
+            *per_layer.entry(layer.as_str()).or_default() += c + m;
+            city += c;
+            metro += m;
+        }
 
         running += city + metro;
         counted += 1;
@@ -175,8 +171,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    let city_bytes: u64 = per_layer.values().sum();
+    if city_bytes > 0 {
+        let mut split: Vec<_> = per_layer.iter().filter(|(_, b)| **b > 0).collect();
+        split.sort_by_key(|(_, b)| std::cmp::Reverse(**b));
+        println!(
+            "\nwhere the city bytes are: {}",
+            split
+                .iter()
+                .map(|(n, b)| format!("{n} {:.0}%", **b as f64 * 100.0 / city_bytes as f64))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     println!(
-        "\n{counted} cities plus the shared rungs: {} resident once every centre is warm",
+        "{counted} cities plus the shared rungs: {} resident once every centre is warm",
         bytes(running)
     );
     println!(
@@ -188,6 +197,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
          once idle -- there is no session, no polling and no socket to hold open."
     );
     Ok(())
+}
+
+/// What to measure: the built-in list when asked for nothing, otherwise each
+/// argument as either a name from that list or a `lat,lon` of its own -- which
+/// is what makes this usable on a build of somewhere the list never heard of.
+fn places(args: Vec<String>) -> Result<Vec<(String, f64, f64)>, String> {
+    if args.is_empty() {
+        return Ok(CITIES
+            .iter()
+            .map(|(n, lat, lon)| (n.to_string(), *lat, *lon))
+            .collect());
+    }
+    let mut out = Vec::with_capacity(args.len());
+    for arg in args {
+        let parts: Vec<&str> = arg.split(',').map(str::trim).collect();
+        match parts.as_slice() {
+            // A name, matched case-insensitively so `paris` works.
+            [name] => {
+                let found = CITIES
+                    .iter()
+                    .find(|(n, ..)| n.eq_ignore_ascii_case(name))
+                    .ok_or_else(|| {
+                        format!(
+                            "no city called {name}. Known: {}. Anywhere else is \
+                             `lat,lon` or `lat,lon,Name`.",
+                            CITIES.iter().map(|(n, ..)| *n).collect::<Vec<_>>().join(", ")
+                        )
+                    })?;
+                out.push((found.0.to_string(), found.1, found.2));
+            }
+            [lat, lon] | [lat, lon, _] => {
+                let (lat, lon) = (
+                    lat.parse::<f64>().map_err(|e| format!("{lat}: {e}"))?,
+                    lon.parse::<f64>().map_err(|e| format!("{lon}: {e}"))?,
+                );
+                if lat.abs() > 90.0 || lon.abs() > 180.0 {
+                    return Err(format!("{lat},{lon} is not a position"));
+                }
+                let name = match parts.as_slice() {
+                    [_, _, name] => (*name).to_string(),
+                    _ => format!("{lat:.3},{lon:.3}"),
+                };
+                out.push((name, lat, lon));
+            }
+            _ => return Err(format!("{arg}: expected a name, `lat,lon`, or `lat,lon,Name`")),
+        }
+    }
+    Ok(out)
 }
 
 /// Stored bytes of every tile of `archive` inside a box of `half_km` around
