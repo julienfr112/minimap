@@ -327,8 +327,15 @@ class Minimap {
         .sort((a, b) => a - b);
       if (rungs.length) this.layerRungs.set(l.name, rungs);
     }
-    if (!this.layerRungs.size) {
-      // A server that said nothing useful, or a cap below every rung there is.
+    // A server that said nothing useful, or a cap below every rung there is.
+    //
+    // `meta.layers` being *present and empty* is not that: it is a server
+    // saying it has no layers, which an embedding hits whenever it is running
+    // without the archives. Guessing rungs there would mean requesting tiles
+    // that provably do not exist, on every frame — so an empty list is
+    // believed, and the viewer draws its background and the host's overlays
+    // over it.
+    if (!this.layerRungs.size && !meta.layers) {
       for (const name of LAYER_ORDER) {
         this.layerRungs.set(name, FALLBACK_LEVELS.filter((z) => z <= this.maxzoom));
       }
@@ -347,7 +354,11 @@ class Minimap {
     // instead would give one stop per rung, every one pixel-native and never
     // stretched, at the price of jumping 4x at a time.
     this.stops = [];
-    for (let z = this.levels[0]; z <= this.maxzoom + OVERZOOM; z++) this.stops.push(z);
+    // With no layers at all there is no shallowest rung to start from, and the
+    // archive's own minzoom is the honest answer — the viewer still has to have
+    // somewhere to sit, because the overlays are drawn whether tiles are or not.
+    const base = this.levels.length ? this.levels[0] : Math.min(this.minzoom, this.maxzoom);
+    for (let z = base; z <= this.maxzoom + OVERZOOM; z++) this.stops.push(z);
 
     this.zoom = this.#snap(meta.center[2]);
     this.center = { lon: meta.center[0], lat: meta.center[1] };
