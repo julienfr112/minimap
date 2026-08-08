@@ -292,12 +292,24 @@ function unproject(x, y) {
 /// `query` reads `?maxzoom`, which under an embedding is somebody else's query
 /// string; `anon` turns a click into a POST, which a host that never asked for
 /// the zone endpoint should not be making.
+/// `base` is the other kind of option: where the server is, rather than what
+/// the viewer does. Empty means every request is relative to the document,
+/// which is what the standalone shell wants -- it *is* served by that server,
+/// and the trailing-slash redirect exists so `tiles/...` resolves under the
+/// nest prefix whatever it is.
+///
+/// An application that embeds the map in pages of its own has no such luck: a
+/// viewer on `/calendar` asking for `tiles/...` asks `/calendar/tiles/...`, and
+/// the failure is quiet -- an absent tile and a 404 are both just "nothing to
+/// draw here", so the map comes out blank rather than broken. Such a host
+/// passes `base: '/map/'`.
 const DEFAULTS = {
   interactive: true,
   keyboard: true,
   hash: true,
   query: true,
   anon: true,
+  base: '',
 };
 
 class Minimap {
@@ -592,7 +604,7 @@ class Minimap {
   #pick(e) {
     if (!this.anon) return;
     const [lon, lat] = this.#eventLonLat(e);
-    fetch('zone', {
+    fetch(`${this.opts.base}zone`, {
       method: 'POST',
       headers: { 'content-type': 'application/x-www-form-urlencoded' },
       body: `lat=${lat.toFixed(6)}&lon=${lon.toFixed(6)}`,
@@ -638,10 +650,12 @@ class Minimap {
     if (hit !== undefined) return hit === 'loading' || hit === 'empty' ? null : hit;
     this.tiles.set(key, 'loading');
     this.pending++;
-    // Relative, like every request this file makes: the server redirects the
-    // shell to a trailing-slash URL, so these resolve correctly whether the
-    // map lives at / or nested under /map/ of some larger application.
-    fetch(`tiles/${name}/${z}/${x}/${y}`)
+    // Relative by default, like every request this file makes: the server
+    // redirects the shell to a trailing-slash URL, so these resolve correctly
+    // whether the map lives at / or nested under /map/ of some larger
+    // application. `base` is for the other case -- a viewer embedded in a page
+    // of the host's own, where relative means relative to *that* page.
+    fetch(`${this.opts.base}tiles/${name}/${z}/${x}/${y}`)
       .then((r) => {
         if (r.status === 204 || r.status === 404) return null;
         if (!r.ok) throw new Error(`${r.status}`);

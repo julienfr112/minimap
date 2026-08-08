@@ -99,8 +99,9 @@ its own maps:
 
 ```js
 const meta = await (await fetch('/map/meta.json')).json();
-const map = new Minimap(canvas, meta, { interactive: false, keyboard: false,
-                                        hash: false, query: false, anon: false });
+const map = new Minimap(canvas, meta, { base: '/map/', interactive: false,
+                                        keyboard: false, hash: false,
+                                        query: false, anon: false });
 map.setView(48.8584, 2.2945, 15);
 map.boxes.push({ west, south, east, north, color: '#f00' });
 map.pins.push({ lat, lon, image: img, onclick: () => select(i) });
@@ -118,6 +119,14 @@ is wrong in an embedding, and silently:
 | `hash` | the URL fragment is the host's; don't read a view out of it |
 | `query` | `?maxzoom` is the host's query string, not a viewer flag |
 | `anon` | a click is not a `POST /zone` |
+
+`base` is the other kind of option — where the server is, not what the viewer
+does. Empty (the default) means relative to the document, which is right for
+the standalone shell because it *is* served by that server. A viewer embedded
+in a host's own page is not: on `/calendar`, `tiles/…` resolves to
+`/calendar/tiles/…`, and **the failure is silent** — an absent tile and a 404
+are both "nothing to draw here", so the map comes out blank rather than broken.
+Pass the prefix, with its trailing slash.
 
 `boxes` and `pins` are plain arrays drawn on top of everything else; mutate
 them and set `dirty = true`. A pin carries `{lat, lon, image, size?, anchor?,
