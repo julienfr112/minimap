@@ -128,12 +128,21 @@ in a host's own page is not: on `/calendar`, `tiles/…` resolves to
 are both "nothing to draw here", so the map comes out blank rather than broken.
 Pass the prefix, with its trailing slash.
 
-`boxes` and `pins` are plain arrays drawn on top of everything else; mutate
-them and set `dirty = true`. A pin carries `{lat, lon, image, size?, anchor?,
-tint?, onclick?}` — `image` is anything `drawImage` takes, and a pin whose
-image has not decoded yet is skipped, so preload and mark dirty on `load`.
-Clicks hit-test against where pins were actually drawn, and a pin takes the
-click before the ground does.
+`boxes`, `circles` and `pins` are plain arrays drawn on top of everything
+else; mutate them and set `dirty = true`.
+
+* `{west, south, east, north, color?, fill?, width?}` — a lon/lat rectangle.
+* `{lat, lon, radius_m, color?, fill?, width?, onclick?}` — **a radius in
+  metres**, which is why it is a primitive here and not something a host draws:
+  it has to be re-derived from the zoom every frame. This is the shape for
+  "somewhere within R of here", i.e. for a `/zone` answer.
+* `{lat, lon, image, size?, anchor?, tint?, onclick?}` — `image` is anything
+  `drawImage` takes, and a pin whose image has not decoded yet is skipped, so
+  preload it and mark the map dirty on `load`.
+
+Clicks hit-test against the geometry the last frame actually drew, so a hit
+agrees with what is on screen; pins take the click before circles, and both
+before the ground.
 
 Two things in the tile route look incidental and are not, if a host is
 tempted to wrap it:

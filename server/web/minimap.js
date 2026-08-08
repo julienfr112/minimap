@@ -269,6 +269,11 @@ function widthScale(zoom) { return 1.6 * 2 ** ((zoom - 10) / 2.4); }
 // is big enough to show (or keep detail it cannot).
 const TILE = 512;
 
+// The equator, in metres -- the whole width of the world at zoom 0, and what
+// turns a radius in metres into one in pixels (see the circles in
+// #drawOverlays). WGS84.
+const EQUATOR = 40075016.686;
+
 function project(lon, lat) {
   const s = Math.sin(lat * Math.PI / 180);
   return [(lon + 180) / 360, 0.5 - Math.log((1 + s) / (1 - s)) / (4 * Math.PI)];
@@ -392,11 +397,13 @@ class Minimap {
     this.anon = this.opts.anon ? meta.anon ?? null : null;
     this.zone = null;
     // Geographic overlays the host draws on top of the map: `boxes` are
-    // lon/lat rectangles, `pins` are points carrying an image. Both are plain
-    // arrays, mutated in place by whoever owns the map -- there is no add/remove
-    // API because there is no state to keep in step, only `dirty = true` after.
+    // lon/lat rectangles, `circles` are points with a radius *in metres*, and
+    // `pins` are points carrying an image. All three are plain arrays, mutated
+    // in place by whoever owns the map -- there is no add/remove API because
+    // there is no state to keep in step, only `dirty = true` after.
     // See #drawOverlays for what a member of each looks like.
     this.boxes = [];
+    this.circles = [];
     this.pins = [];
     this.tiles = new Map(); // "z/x/y" -> layers | 'loading' | 'empty'  (see #keep)
     this.rasters = new Map(); // "z/x/y|layers@zoom" -> canvas  (see #paint)
@@ -517,9 +524,10 @@ class Minimap {
     this.canvas.addEventListener('pointerup', (e) => {
       stop();
       if (Math.hypot(e.clientX - downX, e.clientY - downY) >= CLICK_SLOP) return;
-      // A pin under the pointer takes the click; only ground reaches #pick.
-      // Otherwise selecting a search result would also ask what zone it is in.
-      if (this.#hitPin(e)) return;
+      // An overlay under the pointer takes the click; only ground reaches
+      // #pick. Otherwise selecting a search result would also ask what zone it
+      // is in.
+      if (this.#hitOverlay(e)) return;
       this.#pick(e);
     });
     this.canvas.addEventListener('pointercancel', stop);
@@ -574,10 +582,15 @@ class Minimap {
     );
   }
 
-  // The topmost pin whose box contains the pointer, called for its side effect.
-  // Reverse order, so the pin drawn last -- the one visibly on top where two
-  // overlap -- is the one that answers.
-  #hitPin(e) {
+  // The topmost clickable overlay under the pointer, called for its side
+  // effect. Pins before circles, because that is the order they are drawn in,
+  // and reverse within each -- the one drawn last is the one visibly on top
+  // where two overlap, so it is the one that should answer.
+  //
+  // Both read the geometry the last frame actually *drew* (`at`, `px`), so a
+  // hit agrees with what is on screen by construction and cannot go stale
+  // against a pan or a zoom, either of which redraws.
+  #hitOverlay(e) {
     const rect = this.canvas.getBoundingClientRect();
     const px = e.clientX - rect.left, py = e.clientY - rect.top;
     for (let i = this.pins.length - 1; i >= 0; i--) {
@@ -588,6 +601,15 @@ class Minimap {
       if (px < pin.at[0] - ax || px > pin.at[0] - ax + w) continue;
       if (py < pin.at[1] - ay || py > pin.at[1] - ay + h) continue;
       pin.onclick(pin, i);
+      return true;
+    }
+    for (let i = this.circles.length - 1; i >= 0; i--) {
+      const c = this.circles[i];
+      if (!c.onclick || !c.at) continue;
+      // A generous floor: a zone drawn 3 px across at a wide zoom is still
+      // something the user is aiming at, and a disc that small is unhittable.
+      if (Math.hypot(px - c.at[0], py - c.at[1]) > Math.max(c.px, 10)) continue;
+      c.onclick(c, i);
       return true;
     }
     return false;
@@ -777,8 +799,15 @@ class Minimap {
 
   // The host's own geography, on top of everything the archive drew.
   //
-  //   boxes: { west, south, east, north, color?, fill?, width? }
-  //   pins:  { lat, lon, image, size?, anchor?, onclick?, tint? }
+  //   boxes:   { west, south, east, north, color?, fill?, width? }
+  //   circles: { lat, lon, radius_m, color?, fill?, width?, onclick? }
+  //   pins:    { lat, lon, image, size?, anchor?, onclick?, tint? }
+  //
+  // A circle's radius is in *metres*, not pixels, which is the whole reason it
+  // is a primitive here rather than something a host draws itself: it has to be
+  // re-derived from the zoom on every frame, and getting the projection right
+  // is this file's job. It is the shape for "somewhere within R of here" --
+  // a position known only to a radius, which is what an anonymity zone is.
   //
   // `image` is anything drawImage takes -- an <img> the host preloaded is the
   // expected case. A pin whose image has not decoded yet is skipped rather
@@ -789,7 +818,7 @@ class Minimap {
   // which is what #hitPin reads. Hit-testing therefore agrees with the drawing
   // by construction -- it cannot go stale against a pan, because a pan redraws.
   #drawOverlays(world, originX, originY) {
-    if (!this.boxes.length && !this.pins.length) return;
+    if (!this.boxes.length && !this.circles.length && !this.pins.length) return;
     const ctx = this.ctx;
     const px = (lon, lat) => {
       const p = project(lon, lat);
@@ -811,6 +840,25 @@ class Minimap {
         Math.round(x0) + 0.5, Math.round(y0) + 0.5,
         Math.round(x1 - x0) - 1, Math.round(y1 - y0) - 1,
       );
+    }
+
+    for (const c of this.circles) {
+      if (c.lat == null || c.lon == null) { c.at = null; c.px = 0; continue; }
+      const [x, y] = px(c.lon, c.lat);
+      // Metres to pixels, at this latitude and this zoom. `world` is the whole
+      // globe's width in CSS pixels, and the globe is EQUATOR metres round at
+      // the equator and cos(lat) of that here -- so one metre is that many
+      // pixels. Recomputed per frame because it is a function of the zoom.
+      const scale = world / (EQUATOR * Math.cos(c.lat * Math.PI / 180));
+      const r = Math.max(2, c.radius_m * scale);
+      c.at = [x, y];
+      c.px = r;
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, 2 * Math.PI);
+      if (c.fill) { ctx.fillStyle = c.fill; ctx.fill(); }
+      ctx.strokeStyle = c.color ?? '#f00';
+      ctx.lineWidth = c.width ?? 1;
+      ctx.stroke();
     }
 
     for (const pin of this.pins) {
