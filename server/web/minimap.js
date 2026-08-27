@@ -407,6 +407,7 @@ class Minimap {
     // See #drawOverlays for what a member of each looks like.
     this.boxes = [];
     this.circles = [];
+    this.lines = [];
     this.pins = [];
     this.tiles = new Map(); // "z/x/y" -> layers | 'loading' | 'empty'  (see #keep)
     this.rasters = new Map(); // "z/x/y|layers@zoom" -> canvas  (see #paint)
@@ -804,6 +805,7 @@ class Minimap {
   //
   //   boxes:   { west, south, east, north, color?, fill?, width? }
   //   circles: { lat, lon, radius_m, color?, fill?, width?, onclick? }
+  //   lines:   { points: [[lon, lat], ...], color?, width?, dash? }
   //   pins:    { lat, lon, image, size?, anchor?, onclick? }
   //
   // A circle's radius is in *metres*, not pixels, which is the whole reason it
@@ -811,6 +813,11 @@ class Minimap {
   // re-derived from the zoom on every frame, and getting the projection right
   // is this file's job. It is the shape for "somewhere within R of here" --
   // a position known only to a radius, which is what an anonymity zone is.
+  //
+  // A line is here for the mirror reason: its vertices are geography, so it has
+  // to be re-projected every frame or it slides off the ground under a pan. It
+  // is the shape for "these two things are related", and it is drawn under the
+  // circles and pins -- a connector is context, never the thing being read.
   //
   // `image` is anything drawImage takes -- an <img> the host preloaded is the
   // expected case. A pin whose image has not decoded yet is skipped rather
@@ -821,7 +828,7 @@ class Minimap {
   // which is what #hitPin reads. Hit-testing therefore agrees with the drawing
   // by construction -- it cannot go stale against a pan, because a pan redraws.
   #drawOverlays(world, originX, originY) {
-    if (!this.boxes.length && !this.circles.length && !this.pins.length) return;
+    if (!this.boxes.length && !this.circles.length && !this.lines.length && !this.pins.length) return;
     const ctx = this.ctx;
     const px = (lon, lat) => {
       const p = project(lon, lat);
@@ -843,6 +850,25 @@ class Minimap {
         Math.round(x0) + 0.5, Math.round(y0) + 0.5,
         Math.round(x1 - x0) - 1, Math.round(y1 - y0) - 1,
       );
+    }
+
+    for (const l of this.lines) {
+      // A vertex that is not there drops the whole line rather than pulling it
+      // to (0, 0) -- the host's "nothing is selected" is a null, not a point.
+      const pts = l.points ?? [];
+      if (pts.length < 2 || pts.some((p) => !p || p[0] == null || p[1] == null)) continue;
+      ctx.beginPath();
+      for (let i = 0; i < pts.length; i++) {
+        const [x, y] = px(pts[i][0], pts[i][1]);
+        if (i) ctx.lineTo(x, y); else ctx.moveTo(x, y);
+      }
+      // The dash pattern is restored, not left set: the canvas context is
+      // shared with every pass after this one.
+      if (l.dash) ctx.setLineDash(l.dash);
+      ctx.strokeStyle = l.color ?? '#f00';
+      ctx.lineWidth = l.width ?? 1;
+      ctx.stroke();
+      if (l.dash) ctx.setLineDash([]);
     }
 
     for (const c of this.circles) {
