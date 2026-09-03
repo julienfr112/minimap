@@ -9,7 +9,7 @@
 //! writes values straight into a DuckDB vector and hands the database a whole
 //! column chunk at a time; `append_row` names a row but does not cost one.
 //!
-//! The columns are exactly `config::RAW_DDL`, in order. A row carries the tags
+//! The columns are exactly `tuning::RAW_DDL`, in order. A row carries the tags
 //! its kind can use and nulls elsewhere: a line never carries `building`, an
 //! area never carries `highway`.
 

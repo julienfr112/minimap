@@ -1,0 +1,14 @@
+[package]
+name = "minimap-progress"
+version = "0.1.0"
+edition = "2021"
+
+# One output format for every long-running program in the workspace: a live
+# bar with an ETA on a terminal, accumulating lines in a log. No dependencies,
+# so the anon bake and the server's examples can use it without inheriting
+# anything from the pipeline.
+[lib]
+name = "progress"
+path = "src/lib.rs"
+
+[dependencies]

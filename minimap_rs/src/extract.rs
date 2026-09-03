@@ -25,8 +25,8 @@
 //!   3. nodes     -- coordinates, but only for the nodes step 2 asked for
 //!
 //! For Picardie that stores 13.8M of the file's 15.2M node locations, which is
-//! a thin saving -- at MAXZOOM=14 we keep buildings, and buildings touch nearly
-//! every node there is. The ratio is not the point. The point is that the set
+//! a thin saving -- at a z14 deepest rung we keep buildings, and buildings touch
+//! nearly every node there is. The ratio is not the point. The point is that the set
 //! is known before a single coordinate is stored, so it can be a flat sorted
 //! array of exactly the right length at 16 bytes per node, instead of a
 //! general-purpose sparse map sized for whatever might turn up.
@@ -38,7 +38,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use osmpbf::{BlobDecode, Mmap, MmapBlob, PrimitiveBlock};
 use rayon::prelude::*;
 
-use crate::progress;
 use crate::geom::{self, Pt, Ring};
 use crate::rows::{Interner, Row, Sink, TagSet, Tags, BATCH};
 
@@ -155,16 +154,32 @@ pub fn run(
     let (w_rel, w_way, w_node) = (weight * 0.15, weight * 0.30, weight * 0.30);
     let (w_lines, w_areas, w_multi) = (weight * 0.05, weight * 0.15, weight * 0.05);
 
-    let relations = scan_relations(&blobs, &words, &format!("{label} pass 1/3 relations"), w_rel);
+    let relations = scan_relations(
+        &blobs,
+        &words,
+        &format!("{label} pass 1/3 relations"),
+        w_rel,
+    );
     let wanted: HashSet<i64> = relations
         .iter()
         .flat_map(|r| r.members.iter().copied())
         .collect();
 
-    let mut ways = scan_ways(&blobs, &wanted, &words, &format!("{label} pass 2/3 ways"), w_way);
+    let mut ways = scan_ways(
+        &blobs,
+        &wanted,
+        &words,
+        &format!("{label} pass 2/3 ways"),
+        w_way,
+    );
     ways.refs.index.sort_unstable_by_key(|s| s.way);
 
-    let locations = scan_nodes(&blobs, &ways.refs, &format!("{label} pass 3/3 nodes"), w_node);
+    let locations = scan_nodes(
+        &blobs,
+        &ways.refs,
+        &format!("{label} pass 3/3 nodes"),
+        w_node,
+    );
     progress::line(format!(
         "  {} ways kept, {} multipolygons, {} node locations",
         progress::commas(ways.refs.len() as u64),
@@ -282,7 +297,12 @@ struct RelArea {
 }
 
 /// Pass 1: multipolygon and boundary relations carrying a tag we draw.
-fn scan_relations(blobs: &[MmapBlob<'_>], words: &Interner, pass: &str, weight: f64) -> Vec<RelArea> {
+fn scan_relations(
+    blobs: &[MmapBlob<'_>],
+    words: &Interner,
+    pass: &str,
+    weight: f64,
+) -> Vec<RelArea> {
     scan(
         blobs,
         pass,
@@ -393,7 +413,13 @@ impl WayRefs {
 }
 
 /// Pass 2: the ways we draw, plus the ways the wanted relations are built from.
-fn scan_ways(blobs: &[MmapBlob<'_>], wanted: &HashSet<i64>, words: &Interner, pass: &str, weight: f64) -> Ways {
+fn scan_ways(
+    blobs: &[MmapBlob<'_>],
+    wanted: &HashSet<i64>,
+    words: &Interner,
+    pass: &str,
+    weight: f64,
+) -> Ways {
     scan(
         blobs,
         pass,
@@ -636,4 +662,125 @@ fn build_area(osm_id: i64, tags: Tags, rings: Vec<Vec<u64>>, min_span: f64) -> O
         tags,
         wkb: geom::wkb_multipolygon(&polys),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rows::NO_TAG;
+
+    fn pack(lat: i32, lon: i32) -> u64 {
+        ((lat as u32 as u64) << 32) | lon as u32 as u64
+    }
+
+    #[test]
+    fn positions_pack_and_unpack_with_sign() {
+        for (lat, lon) in [
+            (0, 0),
+            (498_949_000, 23_020_000),
+            (-338_700_000, 1_512_100_000),
+            (1, -1),
+        ] {
+            let [x, y] = unpack(pack(lat, lon));
+            assert!((x - lon as f64 * 1e-7).abs() < 1e-12);
+            assert!((y - lat as f64 * 1e-7).abs() < 1e-12);
+        }
+        assert_ne!(pack(0, 0), MISSING);
+    }
+
+    /// Population is free text in OSM. Digits are kept, everything else is
+    /// dropped, and a city with no usable number is still a city.
+    #[test]
+    fn places_keep_cities_and_towns_and_read_populations_loosely() {
+        let mut out = Vec::new();
+        collect_place(
+            [
+                ("name", "Amiens"),
+                ("place", "city"),
+                ("population", "133 891"),
+            ]
+            .into_iter(),
+            2.3,
+            49.9,
+            &mut out,
+        );
+        collect_place(
+            [
+                ("name", "Doullens"),
+                ("place", "town"),
+                ("population", "approx. 6,000"),
+            ]
+            .into_iter(),
+            2.3,
+            50.1,
+            &mut out,
+        );
+        collect_place(
+            [
+                ("name", "Naours"),
+                ("place", "village"),
+                ("population", "1000"),
+            ]
+            .into_iter(),
+            2.2,
+            50.0,
+            &mut out,
+        );
+        collect_place([("place", "city")].into_iter(), 0.0, 0.0, &mut out);
+        collect_place(
+            [("name", "Corbie"), ("place", "town")].into_iter(),
+            2.5,
+            49.9,
+            &mut out,
+        );
+        let names: Vec<&str> = out.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["Amiens", "Doullens", "Corbie"],
+            "villages and the nameless are skipped"
+        );
+        assert_eq!(out[0].population, 133_891);
+        assert_eq!(out[1].population, 6000);
+        assert_eq!(out[2].population, 0);
+        assert_eq!(out[0].kind, "city");
+    }
+
+    /// Resolving a way drops consecutive duplicate positions (two OSM nodes at
+    /// one coordinate) and fails whole if any node is missing, so a way cut by
+    /// the extract boundary is dropped rather than bridged.
+    #[test]
+    fn resolve_dedups_positions_and_refuses_gaps() {
+        let ids = vec![10, 20, 30, 40];
+        let packed = vec![pack(1, 1), pack(2, 2), pack(2, 2), MISSING];
+        let loc = Locations { ids, packed };
+        assert_eq!(
+            resolve(&[10, 20, 30], &loc),
+            Some(vec![pack(1, 1), pack(2, 2)])
+        );
+        assert_eq!(resolve(&[10, 40], &loc), None, "a node without a location");
+        assert_eq!(
+            resolve(&[10, 99], &loc),
+            None,
+            "a node the extract never had"
+        );
+        assert_eq!(loc.get(40), None, "MISSING reads as absent");
+    }
+
+    #[test]
+    fn interner_hands_out_stable_ids_and_round_trips() {
+        let words = Interner::default();
+        let a = words.intern("yes");
+        let b = words.intern("house");
+        assert_eq!(words.intern("yes"), a);
+        assert_ne!(a, b);
+        assert_eq!(words.get(a).as_deref(), Some("yes"));
+        assert_eq!(words.get(NO_TAG), None);
+        let tags = TagSet {
+            building: a,
+            ..TagSet::default()
+        }
+        .resolve(&words);
+        assert_eq!(tags.building.as_deref(), Some("yes"));
+        assert_eq!(tags.highway, None);
+    }
 }

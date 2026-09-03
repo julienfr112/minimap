@@ -2,9 +2,12 @@
 //!
 //! Serves one PMTiles archive per layer over plain `/tiles/{layer}/{z}/{x}/{y}`,
 //! the two-file viewer that draws them, and -- when an anon index is given --
-//! the `/zone` lookup (see `anon/README.md`). The `minimap-backend` binary is
-//! this crate plus an environment and a listen address; another application
-//! embeds the same thing by nesting the router under a prefix of its own:
+//! the `/zone` lookup (see `anon/README.md`). The viewer is compiled in
+//! (`include_str!` of `web/`), so the binary plus the archives is the whole
+//! deployment: nothing has to sit next to the executable at runtime. The
+//! `minimap-backend` binary is this crate plus an environment and a listen
+//! address; another application embeds the same thing by nesting the router
+//! under a prefix of its own:
 //!
 //! ```ignore
 //! let map = minimap_server::MapServer::open(&opts)?.router();
@@ -22,8 +25,11 @@
 //! cold page fault costs, so it is not worth an owned-slice dance to avoid.)
 //!
 //! The viewer's own requests are all *relative* -- `meta.json`, `tiles/...`,
-//! `zone` -- and the shell is redirected to a trailing-slash URL first, so the
-//! same two files work at `/` and under any nest prefix without knowing which.
+//! `zone` -- and the shell is served with a `<base href>` naming the prefix it
+//! was reached under, so the same two files work at `/` and under any nest
+//! prefix without knowing which. (A redirect to a trailing slash was the
+//! earlier answer, and it was wrong: axum's `nest("/map", ..)` routes `/map`
+//! but not `/map/`, so the redirect landed on a 404.)
 //!
 //! Two constraints the host application has to respect, both explained at
 //! length in `anon/README.md` and `server/README.md`: do not log the `/zone`
@@ -33,30 +39,37 @@
 
 pub mod pmtiles;
 
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{path::PathBuf, sync::Arc};
 
 use axum::{
     extract::{OriginalUri, Path as UrlPath, RawQuery, State},
     http::{header, HeaderMap, StatusCode},
-    response::{IntoResponse, Redirect, Response},
+    response::{IntoResponse, Response},
     routing::get,
     Router,
 };
 
 use pmtiles::Archive;
 
+/// The viewer, compiled in. Editing `web/` and rebuilding is the whole update
+/// path; there is no directory to point the server at and nothing to copy.
+const INDEX_HTML: &str = include_str!("../web/index.html");
+const MINIMAP_JS: &str = include_str!("../web/minimap.js");
+/// What `index` rewrites to the prefix the shell was served under.
+const BASE_PLACEHOLDER: &str = r#"<base href="/">"#;
+
 /// Where everything is. Explicit paths, no environment and no
 /// `CARGO_MANIFEST_DIR`: the same rule the pipeline follows with its `Config`,
 /// because a library that guesses paths is a library that guesses wrong inside
 /// someone else's deployment. The binary is where defaults live.
 pub struct Options {
-    /// Directory of `<layer>.pmtiles` archives -- `make all`'s deliverable.
+    /// Directory of `<name>.<layer>.pmtiles` archives -- `make all`'s
+    /// deliverable. Several builds share it.
     pub tiles: PathBuf,
-    /// Directory holding the viewer (`index.html`, `minimap.js`).
-    pub web: PathBuf,
+    /// Which build to serve: the `<name>` of `<name>.<layer>.pmtiles`. The
+    /// binary lets [`builds`] pick when there is only one; the library wants
+    /// it said.
+    pub name: String,
     /// The anon zone index (`make anon`). `None`, or a missing file, serves
     /// the map without `/zone`; a file that exists but does not parse is an
     /// error, because a corrupt index should stop a deploy, not ship quietly.
@@ -94,10 +107,31 @@ struct Anon {
 /// [`router`]: MapServer::router
 /// [`report`]: MapServer::report
 pub struct MapServer {
+    /// The `<name>` this server was opened on.
+    name: String,
     /// In draw order, which is also the order the viewer is told about them.
     layers: Vec<Layer>,
-    web: PathBuf,
     anon: Option<Anon>,
+}
+
+/// `europe.roads.pmtiles` -> `("europe", "roads")`; `None` for any other file.
+fn split_archive_name(file_name: &str) -> Option<(&str, &str)> {
+    file_name.strip_suffix(".pmtiles")?.split_once('.')
+}
+
+/// The build names present in an archive directory, sorted. What `make all`
+/// wrote there, by the `<name>` half of `<name>.<layer>.pmtiles`.
+pub fn builds(tiles: &std::path::Path) -> std::io::Result<Vec<String>> {
+    let mut names: Vec<String> = std::fs::read_dir(tiles)?
+        .flatten()
+        .filter_map(|e| {
+            let file = e.file_name().to_string_lossy().into_owned();
+            split_archive_name(&file).map(|(name, _)| name.to_string())
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    Ok(names)
 }
 
 /// Draw order. The viewer has its own copy for styling, but the server decides
@@ -121,9 +155,12 @@ impl MapServer {
             .flatten()
         {
             let file = entry.file_name().to_string_lossy().into_owned();
-            let Some(name) = file.strip_suffix(".pmtiles") else {
+            let Some((build, name)) = split_archive_name(&file) else {
                 continue;
             };
+            if build != opts.name {
+                continue;
+            }
             let path = entry.path();
             let archive = Archive::open(&path)?;
             let meta = entry.metadata()?;
@@ -132,7 +169,9 @@ impl MapServer {
             let etag = format!(
                 "\"{:x}-{:x}\"",
                 meta.len(),
-                meta.modified()?.duration_since(std::time::UNIX_EPOCH)?.as_secs()
+                meta.modified()?
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_secs()
             );
             let rungs = json_field(&archive.metadata, "\"rungs\":").unwrap_or_else(|| {
                 format!(
@@ -152,13 +191,28 @@ impl MapServer {
             });
         }
         if layers.is_empty() {
-            return Err(format!(
-                "no .pmtiles in {} -- run `make all` first",
-                opts.tiles.display()
-            )
+            let others = builds(&opts.tiles).unwrap_or_default();
+            return Err(if others.is_empty() {
+                format!(
+                    "no <name>.<layer>.pmtiles in {} -- run `make all` first",
+                    opts.tiles.display()
+                )
+            } else {
+                format!(
+                    "no build called {:?} in {} -- there: {}",
+                    opts.name,
+                    opts.tiles.display(),
+                    others.join(", ")
+                )
+            }
             .into());
         }
-        layers.sort_by_key(|l| ORDER.iter().position(|o| *o == l.name).unwrap_or(usize::MAX));
+        layers.sort_by_key(|l| {
+            ORDER
+                .iter()
+                .position(|o| *o == l.name)
+                .unwrap_or(usize::MAX)
+        });
 
         // A missing index is normal -- the map predates `make anon` -- but a
         // corrupt one is refused loudly rather than served wrongly.
@@ -187,8 +241,8 @@ impl MapServer {
         };
 
         Ok(MapServer {
+            name: opts.name.clone(),
             layers,
-            web: opts.web.clone(),
             anon,
         })
     }
@@ -197,7 +251,7 @@ impl MapServer {
     /// prints at boot. A string rather than println!, because whether a host
     /// application wants this on its stdout is its call, not this crate's.
     pub fn report(&self) -> String {
-        let mut out = String::new();
+        let mut out = format!("  build {}\n", self.name);
         for l in &self.layers {
             out.push_str(&format!(
                 "  {:<12} {:>9} tiles  z{}..{}  {:>8.1} MB\n",
@@ -230,56 +284,40 @@ impl MapServer {
     pub fn router(self) -> Router {
         Router::new()
             .route("/", get(index))
+            .route("/minimap.js", get(script))
             .route("/meta.json", get(meta_json))
             .route("/tiles/{layer}/{z}/{x}/{y}", get(tile))
             .route("/zone", get(zone_from_query).post(zone_from_body))
-            .route("/{*path}", get(asset))
             .with_state(Arc::new(self))
     }
 }
 
-/// The viewer shell -- after making sure its URL ends in a slash.
+/// The viewer shell, with `<base href>` set to wherever it was reached.
 ///
-/// The redirect is what lets the viewer's requests be relative: `meta.json`
-/// resolves against the *document* URL, so at `/map` it would miss the prefix
-/// and at `/map/` it lands. Nesting hands this handler both spellings, and
-/// only the original URI can tell them apart. Fragments (`#zoom/lat/lon`)
-/// survive a redirect in every browser, and the one query parameter is
-/// carried by hand.
-async fn index(State(s): State<S>, OriginalUri(uri): OriginalUri) -> Response {
-    let path = uri.path();
-    if !path.ends_with('/') {
-        let to = match uri.query() {
-            Some(q) => format!("{path}/?{q}"),
-            None => format!("{path}/"),
-        };
-        return Redirect::permanent(&to).into_response();
-    }
-    serve_file(&s.web.join("index.html"), "text/html; charset=utf-8").await
+/// The base is what lets the viewer's requests be relative: `meta.json`
+/// resolves against it, so at `/map` it lands on `/map/meta.json` instead of
+/// `/meta.json`. Only the original URI knows the prefix -- a nested router
+/// sees `/` -- and the shell carries the placeholder this fills in.
+async fn index(OriginalUri(uri): OriginalUri) -> Response {
+    // `/map` and `/map/` both mean the prefix `/map/`; `/` means `/`.
+    let prefix = format!("{}/", uri.path().trim_end_matches('/'));
+    // A request path cannot carry a raw quote or angle bracket -- hyper refuses
+    // the URI -- but this lands in an attribute, so it is escaped regardless.
+    let escaped = prefix
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    let html = INDEX_HTML.replacen(BASE_PLACEHOLDER, &format!("<base href=\"{escaped}\">"), 1);
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response()
 }
 
-/// Static assets from web/. No directory listing, and any path that could climb
-/// out of web/ is refused rather than normalised.
-async fn asset(State(s): State<S>, UrlPath(path): UrlPath<String>) -> Response {
-    if path.contains("..") || path.contains('\\') || path.starts_with('/') {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
-    let content_type = match path.rsplit_once('.').map(|(_, e)| e) {
-        Some("js") => "text/javascript; charset=utf-8",
-        Some("css") => "text/css; charset=utf-8",
-        Some("html") => "text/html; charset=utf-8",
-        Some("json") => "application/json",
-        Some("svg") => "image/svg+xml",
-        _ => "application/octet-stream",
-    };
-    serve_file(&s.web.join(&path), content_type).await
-}
-
-async fn serve_file(path: &Path, content_type: &'static str) -> Response {
-    match tokio::fs::read(path).await {
-        Ok(body) => ([(header::CONTENT_TYPE, content_type)], body).into_response(),
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
-    }
+async fn script() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        MINIMAP_JS,
+    )
+        .into_response()
 }
 
 /// One raw JSON value out of the archive's metadata blob.
@@ -450,7 +488,10 @@ fn zone(s: &MapServer, form: &str) -> Response {
         if i > 0 {
             body.push(',');
         }
-        body.push_str(&format!("[{:.6},{:.6},{:.6},{:.6}]", q[0], q[1], q[2], q[3]));
+        body.push_str(&format!(
+            "[{:.6},{:.6},{:.6},{:.6}]",
+            q[0], q[1], q[2], q[3]
+        ));
     }
     body.push_str("]}");
     (

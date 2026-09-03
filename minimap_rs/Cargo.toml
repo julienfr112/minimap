@@ -8,6 +8,8 @@ name = "minimap"
 path = "src/main.rs"
 
 [dependencies]
+# The live bar / log-line output shared by every long-running program here.
+progress = { path = "../progress", package = "minimap-progress" }
 # The PBF parser. Blobs are independent zlib streams, which is what makes the
 # extraction step scale across cores.
 osmpbf = "0.3"

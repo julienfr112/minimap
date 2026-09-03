@@ -15,7 +15,7 @@
 //!
 //! ## Operating it
 //!
-//!   ANON_INDEX  path to the baked index      (default anon/anon-zones.bin)
+//!   ANON_INDEX  path to the baked index, anon/<name>.anon-zones.bin  (required)
 //!   ANON_K      which tier to answer from    (default: the largest baked)
 //!   ANON_ADDR   listen address               (default 127.0.0.1:8091)
 //!
@@ -56,16 +56,13 @@ type S = Arc<App>;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("anon/serve/ has two parents")
-        .to_path_buf();
+    // No default: the index carries a build name, and `make anon-serve` is
+    // what knows which one.
     let path = std::env::var("ANON_INDEX")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| root.join("anon/anon-zones.bin"));
+        .map_err(|_| "ANON_INDEX is not set -- `make anon-serve` sets it")?;
     if !path.exists() {
-        return Err(format!("{} not found -- run `anon-bake` first", path.display()).into());
+        return Err(format!("{} not found -- run `make anon` first", path.display()).into());
     }
 
     let file = std::fs::File::open(&path)?;

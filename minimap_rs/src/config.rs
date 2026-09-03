@@ -27,10 +27,10 @@ use std::path::{Path, PathBuf};
 
 use duckdb::Connection;
 
-
 type Error = Box<dyn std::error::Error>;
 
 /// One extract on disk: the name it is known by, and where it actually is.
+#[derive(Clone, Debug)]
 pub struct Region {
     pub name: String,
     pub path: PathBuf,
@@ -38,6 +38,12 @@ pub struct Region {
 
 #[derive(Clone, Debug)]
 pub struct Config {
+    /// What this build is called: `picardie`, `europe`, `belgium+netherlands`.
+    /// It prefixes everything a build writes -- `<name>.duckdb`,
+    /// `<name>.<layer>.pmtiles`, `<name>.<stage>.log` -- so two builds share
+    /// the same three directories without one ever overwriting the other, and
+    /// the server is told which one to serve.
+    pub name: String,
     /// The extracts, and the coastline that comes with them. Never written to
     /// by anything but `download`.
     pub pbf: PathBuf,
@@ -55,6 +61,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Config {
         Config {
+            name: String::from("all"),
             pbf: PathBuf::from("pbf"),
             duckdb: PathBuf::from("duckdb"),
             pmtiles: PathBuf::from("pmtiles"),
@@ -90,20 +97,17 @@ impl Config {
     }
 
     pub fn db(&self) -> PathBuf {
-        self.duckdb.join("minimap.duckdb")
+        self.duckdb.join(format!("{}.duckdb", self.name))
     }
 
-    /// One archive per layer. A directory rather than a file, because which
-    /// layers exist is a property of the build.
-    pub fn tiles_dir(&self) -> PathBuf {
-        self.pmtiles.clone()
-    }
-
+    /// One archive per layer, `<name>.<layer>.pmtiles`, all in one directory:
+    /// which layers exist is a property of the build, and which builds exist
+    /// is a property of the directory. [`split_archive_name`] is the inverse.
     pub fn layer_archive(&self, layer: &str) -> PathBuf {
-        self.pmtiles.join(format!("{layer}.pmtiles"))
+        self.pmtiles.join(format!("{}.{layer}.pmtiles", self.name))
     }
 
-    /// Create what this run will write into. `data/` too: `download` is the
+    /// Create what this run will write into. `pbf/` too: `download` is the
     /// first thing anyone runs.
     pub fn prepare(&self) -> Result<(), Error> {
         std::fs::create_dir_all(&self.pbf)?;
@@ -114,26 +118,26 @@ impl Config {
 
     // --- extracts ----------------------------------------------------------
 
-    /// Every `.osm.pbf` under `data/`, by the name it is known by.
+    /// Every `.osm.pbf` under `pbf/`, by the name it is known by.
     ///
     /// Searched recursively and by suffix rather than by consulting a table of
-    /// known regions, so any extract dropped in by hand is loadable and the
-    /// older `data/countries/` layout keeps working untouched. Geofabrik's own
+    /// known regions, so any extract dropped in by hand -- or left in a
+    /// subdirectory by an older layout -- is loadable. Geofabrik's own
     /// `-latest` is stripped, so `france-latest.osm.pbf` and `france.osm.pbf`
     /// are the same region under either name.
     pub fn extracts(&self) -> Vec<Region> {
         let mut found = Vec::new();
         collect_pbfs(&self.pbf, &mut found);
-        // Two files can claim one name -- `data/countries/france-latest.osm.pbf`
+        // Two files can claim one name -- `pbf/old/france-latest.osm.pbf`
         // from an older layout beside `pbf/france.osm.pbf` from this one.
         // Sorting the canonical location first makes the survivor deterministic
         // rather than whatever readdir happened to return, so a load never
         // silently picks the stale copy.
         let canonical = self.pbf.clone();
         found.sort_by(|a, b| {
-            a.name
-                .cmp(&b.name)
-                .then((a.path.parent() != Some(&canonical)).cmp(&(b.path.parent() != Some(&canonical))))
+            a.name.cmp(&b.name).then(
+                (a.path.parent() != Some(&canonical)).cmp(&(b.path.parent() != Some(&canonical))),
+            )
         });
         found.dedup_by(|a, b| a.name == b.name);
         found
@@ -159,11 +163,8 @@ impl Config {
         let mut out = Vec::new();
         let mut missing = Vec::new();
         for name in wanted {
-            match present.iter().position(|r| &r.name == name) {
-                Some(i) => out.push(Region {
-                    name: present[i].name.clone(),
-                    path: present[i].path.clone(),
-                }),
+            match present.iter().find(|r| &r.name == name) {
+                Some(region) => out.push(region.clone()),
                 None => missing.push(name.as_str()),
             }
         }
@@ -230,7 +231,13 @@ impl Config {
         ))?;
         Ok(con)
     }
+}
 
+/// `europe.roads.pmtiles` -> `("europe", "roads")`. `None` for anything that
+/// is not a `<name>.<layer>.pmtiles` file, so a stray file in the directory is
+/// ignored rather than mistaken for a build.
+pub fn split_archive_name(file_name: &str) -> Option<(&str, &str)> {
+    file_name.strip_suffix(".pmtiles")?.split_once('.')
 }
 
 /// Half of this machine's RAM, as DuckDB spells sizes.

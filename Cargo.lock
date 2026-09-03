@@ -46,6 +46,7 @@ version = "0.1.0"
 dependencies = [
  "anon-format",
  "duckdb",
+ "minimap-progress",
  "rayon",
 ]
 
@@ -1042,6 +1043,7 @@ version = "0.1.0"
 dependencies = [
  "duckdb",
  "flate2",
+ "minimap-progress",
  "osmpbf",
  "pmtiles",
  "rayon",
@@ -1049,6 +1051,10 @@ dependencies = [
  "tikv-jemallocator",
  "ureq",
 ]
+
+[[package]]
+name = "minimap-progress"
+version = "0.1.0"
 
 [[package]]
 name = "minimap-server"
@@ -1059,6 +1065,7 @@ dependencies = [
  "flate2",
  "http-body-util",
  "memmap2 0.9.11",
+ "minimap-progress",
  "tokio",
  "tower",
 ]

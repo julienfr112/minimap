@@ -17,8 +17,8 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
-use crate::progress::{self, Step};
 use crate::tuning;
+use progress::Step;
 
 type Error = Box<dyn std::error::Error>;
 
@@ -45,9 +45,9 @@ pub fn run(cfg: &Config, names: &[String], land: bool, europe: bool) -> Result<(
         let elsewhere = cfg.extracts();
         for id in ids {
             let dest = cfg.pbf.join(format!("{id}.osm.pbf"));
-            // An extract already under data/ but not where this layout expects
-            // it -- the older data/countries/ tree, or a file dropped in by
-            // hand. Link it into place rather than spend an hour fetching 5 GB
+            // An extract already under pbf/ but not where this layout expects
+            // it -- a subdirectory from an older layout, or a file dropped in
+            // by hand. Link it into place rather than spend an hour fetching 5 GB
             // that is sitting right there. A hard link, not a move: the file
             // the user put somewhere stays where they put it.
             if !dest.exists() {
@@ -172,7 +172,7 @@ pub fn run(cfg: &Config, names: &[String], land: bool, europe: bool) -> Result<(
 ///
 /// Hard link first, so the bytes never move and neither name is the "real"
 /// one — deleting either leaves the other intact. Falling back to a rename
-/// covers a `data/` split across filesystems, which is unusual but is exactly
+/// covers a `pbf/` split across filesystems, which is unusual but is exactly
 /// the case where copying 5 GB would be the wrong answer.
 fn adopt(from: &Path, to: &Path) -> Result<&'static str, Error> {
     if let Some(parent) = to.parent() {
@@ -322,7 +322,7 @@ fn content_length(url: &str) -> Result<Option<u64>, Error> {
 
 // --- Geofabrik's catalogue -------------------------------------------------
 
-/// Geofabrik's own index of everything it publishes, cached in `data/`.
+/// Geofabrik's own index of everything it publishes, cached in `pbf/`.
 ///
 /// Resolving names through it means there is no table of regions to maintain
 /// here: whatever works on their download page works as a `REGIONS=` entry, and
@@ -345,6 +345,7 @@ impl Index {
         let body = match std::fs::read_to_string(&path) {
             Ok(body) if !body.is_empty() => body,
             _ => {
+                progress::line("fetching Geofabrik's region index (once; cached in pbf/)");
                 let body = ureq::get(tuning::GEOFABRIK_INDEX)
                     .call()?
                     .into_body()
@@ -435,19 +436,14 @@ pub fn list(cfg: &Config) -> Result<(), Error> {
 
     let extra: Vec<&String> = have.iter().filter(|h| !children.contains(h)).collect();
     if !extra.is_empty() {
-        println!("\nalso downloaded: {}",
-            extra.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
+        println!(
+            "\nalso downloaded: {}",
+            extra
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
     Ok(())
-}
-
-/// Where a named region's extract would be written, for callers that need the
-/// path before the file exists.
-pub fn dest(cfg: &Config, id: &str) -> PathBuf {
-    cfg.pbf.join(format!("{id}.osm.pbf"))
-}
-
-/// Whether a path looks like a complete download. Used only for reporting.
-pub fn present(path: &Path) -> bool {
-    std::fs::metadata(path).map(|m| m.len() > 1_000_000).unwrap_or(false)
 }

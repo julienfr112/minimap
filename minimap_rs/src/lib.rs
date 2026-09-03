@@ -21,7 +21,6 @@ pub mod extract;
 pub mod geom;
 pub mod info;
 pub mod load;
-pub mod progress;
 pub mod rows;
 pub mod sql;
 pub mod tuning;

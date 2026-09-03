@@ -5,10 +5,11 @@
 //!
 //!   1. **Leaf directories** (`pmtiles::Archive::leaves`) -- the one place the
 //!      server allocates per request-that-misses. A leaf is gunzipped and
-//!      parsed on first touch and kept forever behind a `Mutex`, so the
-//!      questions are how much the hit saves, how the lock behaves when every
-//!      thread wants the same leaf, and how much memory the cache ends up
-//!      holding when a client walks the whole archive.
+//!      parsed on first touch and kept behind a `Mutex` inside a byte budget
+//!      (`pmtiles::LEAF_CACHE_BYTES`), so the questions are how much the hit
+//!      saves, what an eviction costs, how the lock behaves when every thread
+//!      wants the same leaf, and that the budget actually holds when a client
+//!      walks the whole archive.
 //!   2. **Etags** -- one per archive, computed once at open from the file's
 //!      size and mtime. That makes invalidation a deploy-and-restart, not a
 //!      runtime event, and makes it per layer: re-baking `roads` must not cost
@@ -24,20 +25,21 @@
 //!
 //! ```text
 //! make perf                                # the whole report
-//! MINIMAP_PERF_SCALE=10 make perf          # ten times the iterations
-//! MINIMAP_TILES=pmtiles make perf          # plus the real archives
+//! make perf SCALE=10                       # ten times the iterations
+//! make perf TILES=pmtiles                  # plus the real archives
 //! ```
 //!
 //! Deliberately one `#[test]`: the phases share a process and two of them
 //! measure RSS, which cargo's default parallelism would turn into noise.
 //! Timings are printed rather than asserted -- a threshold that fails on a busy
 //! laptop teaches nobody anything. What *is* asserted is the behaviour the
-//! numbers are supposed to explain: warm beats cold, the cache stays bounded,
-//! and invalidation happens exactly when the archive changes.
+//! numbers are supposed to explain: warm beats cold, the cache stays inside its
+//! budget, and invalidation happens exactly when the archive changes.
+
+mod fixture;
 
 use std::{
     fs,
-    io::Write,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -52,15 +54,12 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use minimap_server::{
-    pmtiles::{tile_id, Archive},
+    pmtiles::{Archive, LEAF_CACHE_BYTES},
     MapServer, Options,
 };
 use tower::ServiceExt;
 
-/// Entries per leaf directory. Real archives pick this to keep the root under
-/// the spec's 16 kB; here it is small on purpose, so a modest fixture still has
-/// hundreds of leaves to miss on.
-const LEAF_SIZE: usize = 128;
+use fixture::{Fixture, Rng, LEAF_SIZE};
 
 /// The fixture's deepest rung. z0..=8 is 87 381 tiles and ~680 leaves -- enough
 /// that a walk over the archive cannot hold its directories in the root. A
@@ -71,6 +70,9 @@ const LEAF_SIZE: usize = 128;
 const DEEP: u8 = 8;
 #[cfg(debug_assertions)]
 const DEEP: u8 = 6;
+
+/// Bytes per cached directory entry, as the reader stores them.
+const ENTRY: usize = 24;
 
 // --- the report -------------------------------------------------------------
 
@@ -93,8 +95,8 @@ fn cache_perf() {
     fs::create_dir_all(&dir).unwrap();
     // Two layers, because half of what invalidation has to get right is that
     // the layers are independent.
-    let roads = Fixture::write(&dir.join("roads.pmtiles"), DEEP, 0x9E37);
-    let land = Fixture::write(&dir.join("land.pmtiles"), 5, 0x2545);
+    let roads = Fixture::write(&dir.join("perf.roads.pmtiles"), DEEP, 0x9E37);
+    let land = Fixture::write(&dir.join("perf.land.pmtiles"), 5, 0x2545);
 
     println!("\nfixture  {}", dir.display());
     println!(
@@ -111,6 +113,7 @@ fn cache_perf() {
     );
 
     leaf_cache(&roads, scale);
+    bounded_cache(&roads);
     contention(&roads, scale);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -171,20 +174,25 @@ fn leaf_cache(fx: &Fixture, scale: f64) {
     let after_sweep = rss();
     row("sweep of every tile, warm", fx.tiles.len(), sweep);
 
-    // The cache holds one parsed directory per leaf and nothing per request, so
-    // its size is a property of the archive. `Entry` is 24 bytes of payload in
-    // a 32-byte slot, and each leaf's Vec is one allocation.
+    // The fixture's directories fit the budget whole, so after a sweep the
+    // cache holds exactly one parsed directory per leaf and nothing per request.
+    let all_leaves = fx.leaves * LEAF_SIZE * ENTRY;
     println!(
-        "  cache ceiling                    {:>8}  ({} leaves x {} entries)",
-        bytes((fx.leaves * LEAF_SIZE * 32) as u64),
+        "  cache after the sweep            {:>8}  ({} leaves x {} entries; budget {})",
+        bytes(archive.cached_leaf_bytes() as u64),
         fx.leaves,
-        LEAF_SIZE
+        LEAF_SIZE,
+        bytes(LEAF_CACHE_BYTES as u64),
+    );
+    assert!(
+        archive.cached_leaf_bytes() <= all_leaves,
+        "the cache holds more than the archive has directories"
     );
     if let (Some(a), Some(b), Some(c)) = (before, after_cold, after_sweep) {
         // A floor, not a measurement: the allocator can satisfy these Vecs out
-        // of memory it already holds, which is why the ceiling above is printed
+        // of memory it already holds, which is why the cache size is printed
         // next to it. Nothing here faults tile *data* in -- `tile()` hands back
-        // a slice of the mmap without reading it, so only the router (phase 4)
+        // a slice of the mmap without reading it, so only the router (phase 5)
         // makes the archive itself resident.
         println!(
             "  RSS filling {:>3} leaves           {:>8}  (resident growth, a floor)",
@@ -197,22 +205,23 @@ fn leaf_cache(fx: &Fixture, scale: f64) {
             thousands(fx.tiles.len() as u64)
         );
         // The point of the phase: a client that keeps asking cannot keep
-        // growing the server. The ceiling is structural, so anything beyond it
-        // plus slack means the cache is keyed by something it should not be.
-        let ceiling = (fx.leaves * LEAF_SIZE * 32) as u64;
+        // growing the server. Anything beyond the directories plus slack means
+        // the cache is keyed by something it should not be.
         assert!(
-            c.saturating_sub(a) < ceiling + (8 << 20),
+            c.saturating_sub(a) < (all_leaves as u64) + (8 << 20),
             "{} of RSS for a cache that cannot exceed {} -- it is not bounded by \
              leaf count",
             bytes(c - a),
-            bytes(ceiling)
+            bytes(all_leaves as u64)
         );
     }
 
     // Sustained hit rate, the steady state of a client panning around one area.
     let iters = scaled(2_000_000, scale);
     let mut rng = Rng::new(1);
-    let hot: Vec<_> = (0..64).map(|_| fx.tiles[rng.below(fx.tiles.len())]).collect();
+    let hot: Vec<_> = (0..64)
+        .map(|_| fx.tiles[rng.below(fx.tiles.len())])
+        .collect();
     let (_, d) = timed(|| {
         let mut acc = 0u64;
         for i in 0..iters {
@@ -233,7 +242,65 @@ fn sum(archive: &Archive, tiles: &[(u8, u32, u32)]) -> u64 {
         .sum()
 }
 
-// --- 2. the lock ------------------------------------------------------------
+// --- 2. the budget ----------------------------------------------------------
+
+/// The bound, exercised: an archive opened with room for a handful of leaves,
+/// swept end to end. The answers must not change, the cache must never pass
+/// its budget, and the price of evicting -- a gunzip per miss instead of a
+/// hit -- is what the last row measures.
+///
+/// This is the phase that stands in for Europe. The real `roads.pmtiles` has
+/// 85M entries in ~2,900 leaves, 2 GB decoded; the default budget holds ~90 of
+/// them, so a client walking the continent evicts constantly. The fixture is
+/// too small to overflow the default, so it is opened with a budget scaled to
+/// its own size instead: eight leaves out of hundreds.
+fn bounded_cache(fx: &Fixture) {
+    section("2. leaf directory cache -- bounded");
+
+    let budget = 8 * LEAF_SIZE * ENTRY;
+    let unbounded = Archive::open(&fx.path).unwrap();
+    let bounded = Archive::open_with_cache(&fx.path, budget).unwrap();
+
+    let (want, _) = timed(|| sum(&unbounded, &fx.tiles));
+    let (_, warm) = timed(|| sum(&unbounded, &fx.tiles));
+    let (got, evicting) = timed(|| sum(&bounded, &fx.tiles));
+    assert_eq!(got, want, "a bounded cache answered differently");
+    assert!(
+        bounded.cached_leaf_bytes() <= budget,
+        "{} cached against a budget of {}",
+        bytes(bounded.cached_leaf_bytes() as u64),
+        bytes(budget as u64)
+    );
+
+    // Random access is the worst case for LRU: every miss is a full gunzip and
+    // the working set is the whole archive.
+    let mut rng = Rng::new(3);
+    let scattered: Vec<_> = (0..fx.tiles.len().min(20_000))
+        .map(|_| fx.tiles[rng.below(fx.tiles.len())])
+        .collect();
+    let (a, spread_warm) = timed(|| sum(&unbounded, &scattered));
+    let (b, spread_evicting) = timed(|| sum(&bounded, &scattered));
+    assert_eq!(a, b);
+    assert!(bounded.cached_leaf_bytes() <= budget);
+
+    row("sweep, everything fits", fx.tiles.len(), warm);
+    row("sweep, 8 leaves of room", fx.tiles.len(), evicting);
+    row("random, everything fits", scattered.len(), spread_warm);
+    row("random, 8 leaves of room", scattered.len(), spread_evicting);
+    println!(
+        "  held after the random walk       {:>8}  (budget {})",
+        bytes(bounded.cached_leaf_bytes() as u64),
+        bytes(budget as u64)
+    );
+    println!(
+        "  (an eviction costs the gunzip it saved -- ~10 us on these {LEAF_SIZE}-entry leaves,\n   \
+         ~0.6 ms on a real archive's 29k-entry ones. The default budget of {} is what\n   \
+         caps the server's heap per archive, whatever a client asks for.)",
+        bytes(LEAF_CACHE_BYTES as u64)
+    );
+}
+
+// --- 3. the lock ------------------------------------------------------------
 
 /// What the `Mutex` around the leaf cache does to concurrency.
 ///
@@ -243,7 +310,7 @@ fn sum(archive: &Archive, tiles: &[(u8, u32, u32)]) -> u64 {
 /// tile, where every thread contends for the same entry -- which is exactly
 /// what a popular view looks like.
 fn contention(fx: &Fixture, scale: f64) {
-    section("2. leaf cache under concurrency");
+    section("3. leaf cache under concurrency");
 
     let archive = Archive::open(&fx.path).unwrap();
     for &(z, x, y) in &fx.tiles {
@@ -253,7 +320,10 @@ fn contention(fx: &Fixture, scale: f64) {
 
     let threads: Vec<usize> = {
         let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
-        [1, 2, 4, 8, 16].into_iter().filter(|&t| t <= cpus.max(1)).collect()
+        [1, 2, 4, 8, 16]
+            .into_iter()
+            .filter(|&t| t <= cpus.max(1))
+            .collect()
     };
     let per_thread = scaled(400_000, scale);
 
@@ -298,7 +368,10 @@ fn contention(fx: &Fixture, scale: f64) {
                 d.as_secs_f64() * 1e9 / ops as f64,
                 rate / baseline,
             );
-            assert!(found > 0, "every lookup missed -- the threads measured nothing");
+            assert!(
+                found > 0,
+                "every lookup missed -- the threads measured nothing"
+            );
         }
     }
     println!(
@@ -309,7 +382,7 @@ fn contention(fx: &Fixture, scale: f64) {
     );
 }
 
-// --- 3. invalidation --------------------------------------------------------
+// --- 4. invalidation --------------------------------------------------------
 
 /// Etags: what they save, when they change, and what they must not touch.
 ///
@@ -317,7 +390,7 @@ fn contention(fx: &Fixture, scale: f64) {
 /// open. So a client's cached tiles survive a restart of an unchanged deploy,
 /// and a re-baked layer invalidates that layer alone.
 async fn invalidation(dir: &Path, roads: &Fixture, land: &Fixture, scale: f64) {
-    section("3. etag invalidation");
+    section("4. etag invalidation");
 
     let app = router(dir);
     let (z, x, y) = roads.tiles[roads.tiles.len() / 3];
@@ -346,11 +419,19 @@ async fn invalidation(dir: &Path, roads: &Fixture, land: &Fixture, scale: f64) {
     // Browsers send lists, and a stale entry alongside a fresh one still hits.
     let list = format!("\"deadbeef-0\", {etag}");
     let (status, _, _) = get(&app, &path, Some(&list)).await;
-    assert_eq!(status, StatusCode::NOT_MODIFIED, "an etag list must be matched by element");
+    assert_eq!(
+        status,
+        StatusCode::NOT_MODIFIED,
+        "an etag list must be matched by element"
+    );
 
     // A validator from another layer must not satisfy this one.
     let (status, _, _) = get(&app, &path, Some(&land_etag)).await;
-    assert_eq!(status, StatusCode::OK, "another layer's etag revalidated this one");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "another layer's etag revalidated this one"
+    );
 
     let iters = scaled(20_000, scale);
     let (_, miss) = timed_async(|| async {
@@ -380,7 +461,7 @@ async fn invalidation(dir: &Path, roads: &Fixture, land: &Fixture, scale: f64) {
     // and the contract in `Archive::open` is that an archive never changes
     // under a running process.
     drop(app);
-    let rebaked = Fixture::write(&dir.join("roads.pmtiles"), DEEP, 0xBEEF);
+    let rebaked = Fixture::write(&dir.join("perf.roads.pmtiles"), DEEP, 0xBEEF);
     assert_ne!(
         rebaked.bytes, roads.bytes,
         "the fixture rebuild must differ in size for the etag to move"
@@ -390,7 +471,10 @@ async fn invalidation(dir: &Path, roads: &Fixture, land: &Fixture, scale: f64) {
     let (status, new_etag, _) = get(&app, &path, None).await;
     assert_eq!(status, StatusCode::OK);
     let new_etag = new_etag.unwrap();
-    assert_ne!(new_etag, etag, "a re-baked archive kept its etag -- clients would serve stale tiles");
+    assert_ne!(
+        new_etag, etag,
+        "a re-baked archive kept its etag -- clients would serve stale tiles"
+    );
 
     // The old validator is now worthless, and must not be honoured.
     let (status, _, body) = get(&app, &path, Some(&etag)).await;
@@ -415,10 +499,10 @@ async fn invalidation(dir: &Path, roads: &Fixture, land: &Fixture, scale: f64) {
     );
 
     // Leave the fixture as the other phases expect to find it.
-    Fixture::write(&dir.join("roads.pmtiles"), DEEP, 0x9E37);
+    Fixture::write(&dir.join("perf.roads.pmtiles"), DEEP, 0x9E37);
 }
 
-// --- 4. memory under load ---------------------------------------------------
+// --- 5. memory under load ---------------------------------------------------
 
 /// RSS across a sustained walk of the archive, through the real router.
 ///
@@ -430,7 +514,7 @@ async fn invalidation(dir: &Path, roads: &Fixture, land: &Fixture, scale: f64) {
 /// growth here would be a leak, and the per-request `Vec` of tile bytes is the
 /// only allocation on the path.
 async fn memory_under_load(dir: &Path, fx: &Fixture, scale: f64) {
-    section("4. memory under load (through the router)");
+    section("5. memory under load (through the router)");
 
     let app = Arc::new(router(dir));
     let concurrency = 32;
@@ -503,7 +587,7 @@ async fn memory_under_load(dir: &Path, fx: &Fixture, scale: f64) {
     }
 }
 
-// --- 5. the real archives ---------------------------------------------------
+// --- 6. the real archives ---------------------------------------------------
 
 /// The same two measurements against whatever `MINIMAP_TILES` points at.
 ///
@@ -513,12 +597,12 @@ async fn memory_under_load(dir: &Path, fx: &Fixture, scale: f64) {
 /// case the cache was built for and the fixture cannot reproduce.
 fn real_archives(scale: f64) {
     let Ok(dir) = std::env::var("MINIMAP_TILES") else {
-        section("5. real archives -- skipped");
+        section("6. real archives -- skipped");
         println!("  `make perf TILES=pmtiles` measures the archives that shipped as well,");
         println!("  which is where a miss stops being a gunzip and becomes a page fault");
         return;
     };
-    section("5. real archives");
+    section("6. real archives");
 
     // Cargo runs a test binary from the *package* directory, so a relative
     // `MINIMAP_TILES=pmtiles` -- the spelling the Makefile and the README use,
@@ -528,7 +612,9 @@ fn real_archives(scale: f64) {
     let dir = if dir.is_dir() {
         dir
     } else {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join(&dir)
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join(&dir)
     };
     let entries = match fs::read_dir(&dir) {
         Ok(entries) => entries,
@@ -542,15 +628,44 @@ fn real_archives(scale: f64) {
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         if let Some(layer) = name.strip_suffix(".pmtiles") {
-            found.push((layer.to_string(), entry.path(), entry.metadata().unwrap().len()));
+            found.push((
+                layer.to_string(),
+                entry.path(),
+                entry.metadata().unwrap().len(),
+            ));
         }
     }
     found.sort_by_key(|(_, _, size)| std::cmp::Reverse(*size));
-    let Some((layer, path, size)) = found.first() else {
+    if found.is_empty() {
         println!("  no .pmtiles in {}", dir.display());
         return;
-    };
-    println!("  {layer}  {:.1} GB", *size as f64 / 1e9);
+    }
+
+    // What an unbounded leaf cache would have grown to, per archive: every
+    // directory entry decoded. This is the arithmetic that put the budget in.
+    println!("  directories, decoded, if every leaf were held:");
+    let mut total = 0u64;
+    for (layer, path, size) in &found {
+        let a = Archive::open(path).unwrap();
+        let decoded = a.entries * ENTRY as u64;
+        total += decoded;
+        println!(
+            "    {layer:<10} {:>7.1} GB  {:>5} leaves  {:>12} entries  {:>9}",
+            *size as f64 / 1e9,
+            a.leaf_count(),
+            thousands(a.entries),
+            bytes(decoded)
+        );
+    }
+    println!(
+        "    {:<10} {:>44}  against a budget of {} per archive",
+        "total",
+        bytes(total),
+        bytes(LEAF_CACHE_BYTES as u64)
+    );
+
+    let (layer, path, size) = &found[0];
+    println!("\n  {layer}  {:.1} GB", *size as f64 / 1e9);
 
     let archive = Archive::open(path).unwrap();
     // Tiles have to be discovered: the reader answers z/x/y, it does not
@@ -602,18 +717,45 @@ fn real_archives(scale: f64) {
     let copy = |a: &Archive| -> u64 {
         tiles
             .iter()
-            .map(|&(z, x, y)| a.tile(z, x, y).map(<[u8]>::to_vec).map_or(0, |b| b.len() as u64))
+            .map(|&(z, x, y)| {
+                a.tile(z, x, y)
+                    .map(<[u8]>::to_vec)
+                    .map_or(0, |b| b.len() as u64)
+            })
             .sum()
     };
     let before = rss();
     let (_, cold) = timed(|| copy(&cold_archive));
     let after = rss();
-    let (bytes_read, warm) = timed(|| copy(&cold_archive));
+    let (bytes_read, again) = timed(|| copy(&cold_archive));
     row("cold, tiles copied out", tiles.len(), cold);
-    row("warm, tiles copied out", tiles.len(), warm);
+    // Random tiles at the deepest rung land one per leaf, so the second pass
+    // is warm only if the sample fits the budget; past that it measures the
+    // eviction cost on real leaves instead, which is the more useful number.
+    let per_leaf = archive.entries as usize / archive.leaf_count().max(1);
+    let fits = LEAF_CACHE_BYTES / (per_leaf * ENTRY).max(1);
+    row(
+        if tiles.len() <= fits {
+            "second pass, every leaf a hit"
+        } else {
+            "second pass, evicting"
+        },
+        tiles.len(),
+        again,
+    );
     println!(
         "  mean tile                        {:>8}",
         bytes(bytes_read / tiles.len() as u64)
+    );
+    println!(
+        "  leaf cache after the sample      {:>8}  (budget {}; ~{} entries a leaf, so room for ~{fits})",
+        bytes(cold_archive.cached_leaf_bytes() as u64),
+        bytes(LEAF_CACHE_BYTES as u64),
+        thousands(per_leaf as u64),
+    );
+    assert!(
+        cold_archive.cached_leaf_bytes() <= LEAF_CACHE_BYTES,
+        "the leaf cache passed its budget on a real archive"
     );
     if let (Some(a), Some(b)) = (before, after) {
         let grew = b.saturating_sub(a);
@@ -647,7 +789,7 @@ fn to_tile(lon: f64, lat: f64, z: u8) -> (u32, u32) {
 fn router(tiles: &Path) -> axum::Router {
     MapServer::open(&Options {
         tiles: tiles.to_path_buf(),
-        web: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("web"),
+        name: "perf".to_string(),
         // The zone index is a different mmap and a different question; nothing
         // on the tile path touches it.
         zones: None,
@@ -719,211 +861,6 @@ async fn hammer(
     }
 }
 
-// --- a synthetic PMTiles archive --------------------------------------------
-
-/// A valid PMTiles v3 archive, written here rather than baked.
-///
-/// The perf question is about directories and lookups, not about map data, so
-/// the tiles hold deterministic filler. What has to be real is the structure:
-/// gzipped root and leaves, one leaf level, entries in Hilbert order -- because
-/// that structure is what the cache is caching.
-struct Fixture {
-    path: PathBuf,
-    /// Every z/x/y in the archive, in id order. The perf phases sample this
-    /// rather than guessing coordinates.
-    tiles: Vec<(u8, u32, u32)>,
-    leaves: usize,
-    bytes: u64,
-}
-
-impl Fixture {
-    fn write(path: &Path, max_zoom: u8, salt: u64) -> Fixture {
-        // Every position of every rung, sorted the way the format wants them.
-        let mut all: Vec<(u64, u8, u32, u32)> = Vec::new();
-        for z in 0..=max_zoom {
-            let n = 1u32 << z;
-            for x in 0..n {
-                for y in 0..n {
-                    all.push((tile_id(z, x, y).unwrap(), z, x, y));
-                }
-            }
-        }
-        all.sort_by_key(|&(id, ..)| id);
-
-        // Tile bodies, gzipped as the format requires and as the server assumes
-        // when it passes them through with Content-Encoding.
-        let mut data = Vec::new();
-        let mut entries = Vec::with_capacity(all.len());
-        for &(id, z, ..) in &all {
-            let body = filler(id ^ salt, z);
-            let gz = gzip(&body);
-            entries.push(Entry {
-                tile_id: id,
-                offset: data.len() as u64,
-                length: gz.len() as u32,
-                run_length: 1,
-            });
-            data.extend_from_slice(&gz);
-        }
-
-        // One leaf per LEAF_SIZE entries; the root points at the leaves, which
-        // is the shape that makes a lookup miss twice before it can hit.
-        let mut leaf_section = Vec::new();
-        let mut root = Vec::new();
-        for chunk in entries.chunks(LEAF_SIZE) {
-            let gz = gzip(&serialise(chunk));
-            root.push(Entry {
-                tile_id: chunk[0].tile_id,
-                offset: leaf_section.len() as u64,
-                length: gz.len() as u32,
-                // 0 is what marks a root entry as a pointer into the leaf
-                // section rather than at a tile.
-                run_length: 0,
-            });
-            leaf_section.extend_from_slice(&gz);
-        }
-        let leaves = root.len();
-        let root_gz = gzip(&serialise(&root));
-
-        let meta = format!(
-            r#"{{"name":"perf","rungs":[{}],"attribution":"synthetic"}}"#,
-            (0..=max_zoom).map(|z| z.to_string()).collect::<Vec<_>>().join(",")
-        );
-        let meta_gz = gzip(meta.as_bytes());
-
-        // header | root | metadata | leaves | tiles
-        let root_off = 127u64;
-        let meta_off = root_off + root_gz.len() as u64;
-        let leaf_off = meta_off + meta_gz.len() as u64;
-        let data_off = leaf_off + leaf_section.len() as u64;
-
-        let mut h = vec![0u8; 127];
-        h[0..7].copy_from_slice(b"PMTiles");
-        h[7] = 3;
-        put_u64(&mut h, 8, root_off);
-        put_u64(&mut h, 16, root_gz.len() as u64);
-        put_u64(&mut h, 24, meta_off);
-        put_u64(&mut h, 32, meta_gz.len() as u64);
-        put_u64(&mut h, 40, leaf_off);
-        put_u64(&mut h, 48, leaf_section.len() as u64);
-        put_u64(&mut h, 56, data_off);
-        put_u64(&mut h, 64, data.len() as u64);
-        put_u64(&mut h, 72, all.len() as u64); // addressed tiles
-        put_u64(&mut h, 80, all.len() as u64); // tile entries
-        put_u64(&mut h, 88, all.len() as u64); // distinct contents
-        h[96] = 1; // clustered
-        h[97] = 2; // internal compression: gzip -- the reader insists
-        h[98] = 2; // tile compression: gzip
-        h[99] = 1; // tile type: MVT
-        h[100] = 0;
-        h[101] = max_zoom;
-        put_i32(&mut h, 102, -1800000000); // the whole world, in 1e7 degrees
-        put_i32(&mut h, 106, -850511287);
-        put_i32(&mut h, 110, 1800000000);
-        put_i32(&mut h, 114, 850511287);
-        h[118] = max_zoom / 2;
-        put_i32(&mut h, 119, 0);
-        put_i32(&mut h, 123, 0);
-
-        let mut out = Vec::with_capacity(data_off as usize + data.len());
-        out.extend_from_slice(&h);
-        out.extend_from_slice(&root_gz);
-        out.extend_from_slice(&meta_gz);
-        out.extend_from_slice(&leaf_section);
-        out.extend_from_slice(&data);
-        // Written whole and renamed, so a reader never sees a half-written
-        // archive -- and so the mtime the etag is built from is the moment the
-        // file became complete.
-        let tmp = path.with_extension("pmtiles.tmp");
-        fs::write(&tmp, &out).unwrap();
-        fs::rename(&tmp, path).unwrap();
-
-        // Reading it back through the reader under test is the cheapest
-        // possible guard against measuring a fixture that is subtly wrong.
-        let check = Archive::open(path).unwrap();
-        let (_, z, x, y) = all[all.len() / 2];
-        assert!(
-            check.tile(z, x, y).is_some(),
-            "the fixture is malformed: {z}/{x}/{y} is missing"
-        );
-
-        Fixture {
-            path: path.to_path_buf(),
-            tiles: all.into_iter().map(|(_, z, x, y)| (z, x, y)).collect(),
-            leaves,
-            bytes: out.len() as u64,
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct Entry {
-    tile_id: u64,
-    offset: u64,
-    length: u32,
-    run_length: u32,
-}
-
-/// A directory: count, then four columnar runs of varints. Offsets are always
-/// written explicitly (`offset + 1`) rather than using the contiguous-run
-/// shorthand -- the shorthand saves bytes in a real archive and changes nothing
-/// about what a lookup costs.
-fn serialise(entries: &[Entry]) -> Vec<u8> {
-    let mut out = Vec::new();
-    varint(&mut out, entries.len() as u64);
-    let mut last = 0u64;
-    for e in entries {
-        varint(&mut out, e.tile_id - last);
-        last = e.tile_id;
-    }
-    for e in entries {
-        varint(&mut out, u64::from(e.run_length));
-    }
-    for e in entries {
-        varint(&mut out, u64::from(e.length));
-    }
-    for e in entries {
-        varint(&mut out, e.offset + 1);
-    }
-    out
-}
-
-fn varint(out: &mut Vec<u8>, mut v: u64) {
-    while v >= 0x80 {
-        out.push((v as u8) | 0x80);
-        v >>= 7;
-    }
-    out.push(v as u8);
-}
-
-fn put_u64(b: &mut [u8], at: usize, v: u64) {
-    b[at..at + 8].copy_from_slice(&v.to_le_bytes());
-}
-
-fn put_i32(b: &mut [u8], at: usize, v: i32) {
-    b[at..at + 4].copy_from_slice(&v.to_le_bytes());
-}
-
-fn gzip(bytes: &[u8]) -> Vec<u8> {
-    let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-    e.write_all(bytes).unwrap();
-    e.finish().unwrap()
-}
-
-/// Stand-in tile bytes: a few hundred of them, deterministic, and compressible
-/// like a vector tile rather than like noise.
-fn filler(seed: u64, z: u8) -> Vec<u8> {
-    let mut rng = Rng::new(seed);
-    let len = 200 + (z as usize * 60) + rng.below(400);
-    let mut out = Vec::with_capacity(len);
-    while out.len() < len {
-        out.extend_from_slice(&rng.next().to_le_bytes()[..4]);
-        out.extend_from_slice(b"minimap");
-    }
-    out.truncate(len);
-    out
-}
-
 // --- measuring --------------------------------------------------------------
 
 /// Resident set size, in bytes. Linux only: `/proc/self/statm`'s second field
@@ -986,23 +923,4 @@ fn thousands(n: u64) -> String {
         out.push(c);
     }
     out
-}
-
-/// xorshift64*, so every run samples the same tiles in the same order. A perf
-/// number that moves because the sample moved is not a perf number.
-struct Rng(u64);
-
-impl Rng {
-    fn new(seed: u64) -> Rng {
-        Rng(seed.wrapping_mul(0x9E3779B97F4A7C15) | 1)
-    }
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-    fn below(&mut self, n: usize) -> usize {
-        (self.next() % n.max(1) as u64) as usize
-    }
 }
