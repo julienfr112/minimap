@@ -380,6 +380,10 @@ adopt: | dirs
 	    n=$$(basename "$$f" | sed 's/-latest//'); \
 	    [ -e "$(PBF)/$$n" ] || { echo "$$f -> $(PBF)/$$n"; mv "$$f" "$(PBF)/$$n"; }; \
 	done
+	@for f in *.log *.log.*; do \
+	    [ -e "$$f" ] || continue; \
+	    [ -e "$(LOG)/$$f" ] || { echo "$$f -> $(LOG)/$$f"; mv "$$f" "$(LOG)/$$f"; }; \
+	done
 	@echo 'done -- `make info` should see them now'
 
 # Every file the build produces and what it is for, so that "what is the target"

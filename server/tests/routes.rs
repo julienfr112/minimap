@@ -2,9 +2,13 @@
 //!
 //! Every status code the viewer branches on is asserted here, because the
 //! viewer treats them as facts: 204 is "nothing there", 404 is "no such
-//! layer", 304 is "keep what you have", and a redirect to a trailing slash is
-//! what lets every viewer request be relative. Silent drift in any of them
-//! shows up as a blank map, not as an error.
+//! layer", 304 is "keep what you have". Silent drift in any of them shows up
+//! as a blank map, not as an error -- an absent tile and a 404 are the same
+//! thing to a renderer.
+//!
+//! The shell's `<base href>` is here for the same reason: it is what makes
+//! every other viewer request relative, so if it stops naming the prefix the
+//! map goes blank under a nest and nowhere else.
 
 mod fixture;
 

@@ -43,7 +43,29 @@ make build                                   # target/release/minimap-backend
 MINIMAP_TILES=/srv/pmtiles MINIMAP_NAME=europe ANON_INDEX=/srv/europe.anon-zones.bin minimap-backend
 ```
 
-`MINIMAP_NAME` can be left out when the directory holds a single build.
+The environment is the whole of its configuration:
+
+| | | default |
+|---|---|---|
+| `MINIMAP_TILES` | directory of `<name>.<layer>.pmtiles` | `pmtiles/` in the checkout |
+| `MINIMAP_NAME` | which build to serve | the only one there |
+| `MINIMAP_PORT` | listen port | `8090` |
+| `ANON_INDEX` | the zone index | `anon/<name>.anon-zones.bin` |
+| `ANON_K` | which baked tier `/zone` answers from | the most private one baked |
+
+`MINIMAP_NAME` can be left out when the directory holds a single build; with
+several it is an error naming the ones present, rather than a silent pick. The
+two path defaults are relative to the checkout and exist for `make serve` — a
+real deployment sets both. An unparseable `MINIMAP_PORT` is an error, not a
+fallback to 8090, because a server quietly on the wrong port is worse than one
+that did not start.
+
+**It binds `0.0.0.0`**, so it is reachable on every interface the moment it
+starts. That is right behind a reverse proxy and wrong in front of one: there
+is no TLS here, no rate limit, and — if the zone index is loaded — a `/zone`
+route whose whole point is that its arguments must not be logged. `anon-serve`
+defaults to `127.0.0.1:8091` instead (`ANON_ADDR`), because the zone lookup is
+the half most likely to be deployed alone and behind something.
 
 ## Zones alone
 
@@ -142,21 +164,37 @@ in a host's own page is not: on `/calendar`, `tiles/…` resolves to
 are both "nothing to draw here", so the map comes out blank rather than broken.
 Pass the prefix, with its trailing slash.
 
-`boxes`, `circles` and `pins` are plain arrays drawn on top of everything
-else; mutate them and set `dirty = true`.
+`boxes`, `lines`, `circles` and `pins` are plain arrays drawn on top of
+everything the archive drew; mutate them and set `dirty = true`. They are
+drawn in that order, which is also least to most important: a box is an
+extent, a line is context, a circle is an answer, a pin is a thing.
 
-* `{west, south, east, north, color?, fill?, width?}` — a lon/lat rectangle.
-* `{lat, lon, radius_m, color?, fill?, width?, onclick?}` — **a radius in
-  metres**, which is why it is a primitive here and not something a host draws:
-  it has to be re-derived from the zoom every frame. This is the shape for
-  "somewhere within R of here", i.e. for a `/zone` answer.
-* `{lat, lon, image, size?, anchor?, onclick?}` — `image` is anything
-  `drawImage` takes, and a pin whose image has not decoded yet is skipped, so
-  preload it and mark the map dirty on `load`.
+* `map.boxes` — `{west, south, east, north, color?, fill?, width?}`, a lon/lat
+  rectangle.
+* `map.lines` — `{points: [[lon, lat], …], color?, width?, dash?}`, a polyline
+  in geography. Note the order inside each pair: **`[lon, lat]`**, x before y,
+  where every other primitive here names its fields. A vertex that is `null`
+  or missing drops the whole line rather than pulling it to (0, 0), because a
+  host's "nothing is selected" is an absence and not a point. This is the
+  shape for "these two are related" — a viewer's own position joined to the
+  thing on the map it is reading.
+* `map.circles` — `{lat, lon, radius_m, color?, fill?, width?, onclick?}`,
+  **a radius in metres**, which is why it is a primitive here and not
+  something a host draws: it has to be re-derived from the zoom every frame.
+  This is the shape for "somewhere within R of here", i.e. for a `/zone`
+  answer.
+* `map.pins` — `{lat, lon, image, size?, anchor?, onclick?}`, where `image` is
+  anything `drawImage` takes. A pin whose image has not decoded yet is
+  skipped, so preload it and mark the map dirty on `load`.
+
+Lines and circles exist here rather than in the host for the same reason:
+their geometry is geography, so it has to be re-projected on every frame or it
+slides off the ground under a pan.
 
 Clicks hit-test against the geometry the last frame actually drew, so a hit
 agrees with what is on screen; pins take the click before circles, and both
-before the ground.
+before the ground. Boxes and lines are not clickable — they are context, and
+a connector nobody can grab is one less thing to explain.
 
 Two things in the tile route look incidental and are not, if a host is
 tempted to wrap it:

@@ -212,9 +212,9 @@ hours and most changes do not need one.
 The stages depend on **`minimap_rs/src/tuning.rs`** — the rungs, the layers, the
 classes, the size thresholds, the SQL derived from them. Editing it makes the
 database stale and `make all` reloads. Editing anything else under `minimap_rs/`
-deliberately does *not* invalidate: `extract.rs` and `progress.rs` change how the
-work is done, not what comes out, and a performance fix should not cost you an
-eight-hour bake.
+deliberately does *not* invalidate: `extract.rs` and the `progress` crate change
+how the work is done, not what comes out, and a performance fix should not cost
+you an eight-hour bake.
 
 `REGIONS` is part of the load's identity too, hashed into the stamp name.
 A plain prerequisite could not do it: `features` is the union of the extracts,
@@ -360,24 +360,28 @@ Makefile           the interface: stages, their order, and what each `clean-*` r
 README.md          this
 minimap_rs/        the build tool: download / load / bake / export / info / sql
   src/tuning.rs      what the map IS: layers, classes, thresholds, the SQL
-  src/config.rs      what a RUN is: which directories, which zooms
-  src/progress.rs    one output format: live bar + ETA, or lines in a log
+  src/config.rs      what a RUN is: which directories, which name, which zooms
   src/download.rs    Geofabrik + coastline, resumable and concurrent
   src/extract.rs     .osm.pbf -> staging rows, on every core
   src/geom.rs        ring assembly, hole nesting, WKB
+  src/rows.rs        the staging appender: one DuckDB column chunk at a time
   src/load.rs        raw -> features (classification SQL)
   src/bake.rs        features -> tile_layers (tiling SQL)
   src/export.rs      tile_layers -> one pmtiles archive per layer
+  src/info.rs        `make info` -- what is in the build right now
   src/sql.rs         `minimap sql` -- ask the build database something
   attic/             programs that were needed once; see its README
+progress/          the live bar and the ETA, shared by everything that runs long
 server/            serves the archives: axum + mmapped PMTiles, no database
   README.md          embedding the map and/or the zones in your own axum app
+  src/lib.rs         the router: five routes, and the archives behind them
   src/pmtiles.rs     the archive reader, and its bounded leaf cache
   web/index.html     page shell, compiled into the binary
   web/minimap.js     protobuf reader + MVT decoder + canvas renderer, likewise
   web/minimap.test.js  the decoder, under node
   tests/routes.rs    every status code the viewer relies on
   tests/cache_perf.rs  `make perf`: what the server's caches cost
+  examples/working-set.rs  `make working-set`: how much has to stay in RAM
 anon/              a separate service on the same `features` table
 
 pbf/               downloaded. Only `clean-pbf` removes it, and it asks.
@@ -393,6 +397,45 @@ the first changes the map, editing the second only changes where it lands.
 Nothing in the pipeline reads an environment variable or derives a path from
 `CARGO_MANIFEST_DIR` — every step takes a `&Config`, which is what makes the
 build directory a flag rather than a rebuild.
+
+## How it is tested
+
+`make test` is the whole suite in seconds — 58 Rust tests and 6 under node,
+none of which needs a download, a database, or a baked archive. `make check`
+is `cargo fmt --check` plus clippy with warnings as errors. Both run
+optimised and share one `target/` with the pipeline, because a debug build of
+`bundled` DuckDB is a second four-minute compile that buys nothing.
+
+| where | what it pins |
+| --- | --- |
+| `minimap_rs/src/geom.rs` | ring assembly, the shared-wall cancellation, hole nesting by containment, WKB byte layout |
+| `anon/format/src/lib.rs` | the on-disk index the bake and the service must agree on byte for byte |
+| `server/tests/routes.rs` | every status code the viewer branches on, and the `<base href>` under a nest |
+| `server/src/pmtiles.rs` | Hilbert ids against the spec's worked values, directory round-trips, leaf eviction |
+| `minimap_rs/src/tuning.rs` | the derivations — `min_span` against the tile geometry, road minzooms clamped to the rungs |
+| `progress/src/lib.rs` | the formatters, and that the ETA declines to guess before it can |
+| `server/web/minimap.test.js` | the protobuf reader and the MVT decoder, against tiles encoded by hand |
+| `minimap_rs/src/bake.rs` | band partitioning: contiguous, complete, and one statement when the rung fits |
+| `minimap_rs/src/extract.rs` | position packing, and reading a population out of `approx. 6,000` |
+
+**Nothing under test reads an `.osm.pbf` or a baked archive.** The load's tests
+run against in-memory DuckDB, the server's write valid PMTiles archives of
+their own (`server/tests/fixture/mod.rs`), and the decoder's encode their tiles
+by hand. That is what keeps the suite at seconds instead of the hours a real
+build takes, which is the only reason it is worth running before every commit.
+
+Two things are deliberately left out. **The renderer**, which is checked by
+looking at it: a golden-image test of a canvas is a test of the font stack and
+the GPU, and it fails on someone else's machine for reasons that have nothing
+to do with the map. And **the geometry SQL**, which is checked through its
+outputs rather than statement by statement — DuckDB's spatial functions are
+not this repository's code, and a test that asserts what `ST_Simplify` returns
+is a test of DuckDB's version.
+
+`make perf` is the one thing `make test` skips, because it reports rather than
+asserts: what a leaf-cache hit costs, what a 304 saves, RSS under sustained
+load. It is a number to read, not a gate to pass — `make perf TILES=pmtiles`
+runs it against the archives that actually shipped.
 
 ## Notes and limitations
 

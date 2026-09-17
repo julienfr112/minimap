@@ -21,7 +21,7 @@ consulted: no database, no geometry library, no decompression pass.
 [`Index::zone`]: format/src/lib.rs
 
 ```bash
-make anon           # cut the zones from the pipeline database (35 s over Europe)
+make anon           # cut the zones from the pipeline database (90 s over Europe)
 make anon-serve     # the standalone service, http://127.0.0.1:8091
 curl -d 'lat=49.8949&lon=2.3020' localhost:8091/zone
 ```
@@ -243,7 +243,10 @@ means anyone who asks twice keeps the smaller answer. One `k` per deployment
 
   (Caddy: `log_skip` on the route.) Answers are `Cache-Control: private` for
   the same reason — a CDN entry keyed on a lat/lon URL is that log by another
-  name.
+  name. `anon-serve` binds `127.0.0.1:8091` by default, which is what makes
+  the `proxy_pass` above the only way in; `ANON_ADDR` moves it, and moving it
+  off loopback puts the lookup in front of the proxy that was carrying the
+  `access_log off`.
 * **Coverage is a disclosure.** A position outside the baked region gets a 404
   rather than the nearest zone on the wrong continent, which does say "outside
   Europe" about it. Deliberate, coarse, and the one documented exception to the
