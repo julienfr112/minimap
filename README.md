@@ -701,21 +701,34 @@ checks it holds against the archives that shipped.
 | a map on screen that nobody is touching | nothing — no session, no polling, no socket to hold |
 | a return visit inside 7 days | a few 304s (`max-age=604800`, one etag per archive) |
 
-**Where the ceiling is.** A warm tile is ~1.8 µs of work in this process;
-divide by 5–10 for the real network stack and four cores serve on the order of
-30–50k tiles/s, halved again if they also terminate TLS. Against that, the
-tiles/s per user below is the one estimated column — everything else here was
-measured:
+**Where the ceiling is.** Measured over a real socket rather than derived from
+the per-tile cost: the release binary pinned to **four cores** serves
+**150 000 tiles/s at 700 Mbit/s** on a warm city working set — mean 52 µs at 8
+connections, 208 µs at 32, 3.5 ms at 512, and no errors anywhere in that range.
+Pinned to **two cores** it serves **96 000 at 448 Mbit/s**. Throughput is flat
+from 8 connections to 512, so saturation costs latency rather than failures,
+and RSS is 25 MB after five million requests. Halve it again for TLS in the
+same process, though normally a proxy terminates that.
+
+Against those, the tiles/s per user below is the one estimated column —
+everything else here was measured:
 
 | behaviour | tiles/s each | 4 cores | 1 Gbit uplink | 100 Mbit uplink |
 | --- | ---: | ---: | ---: | ---: |
-| map open, occasional interaction | ~0.5 | 60 000+ | 100 000+ | ~20 000 |
-| browsing — a view change every ~8 s | ~4 | **8 000–12 000** | ~20 000 | **~2 000** |
-| continuous panning | ~45 | ~1 000 | ~2 700 | ~270 |
+| map open, occasional interaction | ~0.5 | 300 000 | 100 000+ | ~20 000 |
+| browsing — a view change every ~8 s | ~4 | **37 000** | ~20 000 | **~2 000** |
+| continuous panning | ~45 | ~3 300 | ~2 700 | ~270 |
 
-So: a few thousand concurrently *interacting* users on four cores, and tens of
-thousands with the map merely on screen. On a gigabit link the HTTP layer is
-reached first; on 100 Mbit the uplink is the wall long before this server is.
+The `4 cores` column is that 150 000 divided by the row; the uplink columns are
+unchanged and are what binds first on anything under a gigabit. That is the
+useful conclusion and it did not change when the ceiling was measured: **the
+network is the wall, not this process.**
+
+So: on a gigabit link, ~20 000 concurrently *browsing* users and a couple of
+thousand panning continuously — both of those are the uplink's number, not the
+processor's, which is 37 000 and 3 300. With the map merely on screen it is
+hundreds of thousands and the question stops being interesting. On 100 Mbit the
+uplink is the wall long before this server is, by a factor of ten.
 
 Three things bite before the tile path does:
 
