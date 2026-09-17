@@ -18,7 +18,7 @@ path = "src/main.rs"
 # service and a proxy rule until something needs them separated.
 anon-format = { path = "../anon/format" }
 axum = "0.8"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 # The archive is mmapped rather than read, so tile bytes are never copied into
 # the process and the kernel decides what stays resident. This is what lets a
 # 14 GB archive be served from a 1 GB VPS.
@@ -32,4 +32,6 @@ flate2 = "1"
 # already in the tree as axum's own dependencies, so this adds nothing to build.
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+# The bar the working-set example draws while it walks the archives.
+progress = { path = "../progress", package = "minimap-progress" }
 http-body-util = "0.1"

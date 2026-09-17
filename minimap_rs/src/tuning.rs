@@ -26,7 +26,11 @@ pub const ZOOMS: [u8; 4] = [10, 12, 15, 17];
 
 /// The rungs as `10,12,15,17`, for banners and for the archive metadata.
 pub fn zooms_csv() -> String {
-    ZOOMS.iter().map(|z| z.to_string()).collect::<Vec<_>>().join(",")
+    ZOOMS
+        .iter()
+        .map(|z| z.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 pub fn minzoom() -> u8 {
@@ -107,8 +111,8 @@ pub const LANDUSE_PIXELS: f64 = 12.0;
 /// so the extractor skips it before paying for WKB. This is what keeps ~1.8M
 /// sub-pixel buildings per region out of the database.
 ///
-/// It is also why a database is specific to the maxzoom it was loaded for, and
-/// why the Makefile puts that number in the stamp filename.
+/// It is also why a database is specific to the deepest rung it was loaded
+/// for, and why the Makefile's stages depend on this file.
 pub fn min_span() -> f64 {
     MIN_PIXELS * MPP0 / (1u32 << maxzoom()) as f64
 }
@@ -216,9 +220,7 @@ pub fn road_class_sql(col: &str) -> String {
 pub fn road_minzoom_sql(col: &str) -> String {
     let arms: Vec<String> = ROAD_CLASSES
         .iter()
-        .map(|(cls, _, mz)| {
-            format!("WHEN '{cls}' THEN {}", (*mz).clamp(minzoom(), maxzoom()))
-        })
+        .map(|(cls, _, mz)| format!("WHEN '{cls}' THEN {}", (*mz).clamp(minzoom(), maxzoom())))
         .collect();
     format!("CASE {col} {} ELSE {} END", arms.join(" "), maxzoom())
 }
@@ -331,3 +333,97 @@ pub const RAW_DDL: &str = r#"
     "kind" VARCHAR, "osm_id" BIGINT, "name" VARCHAR, "highway" VARCHAR,
     "waterway" VARCHAR, "building" VARCHAR, "landuse" VARCHAR, "natural" VARCHAR,
     "leisure" VARCHAR, "water" VARCHAR, "wkb" BLOB"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rungs_are_sorted_and_bracket_the_background_cap() {
+        assert!(ZOOMS.windows(2).all(|w| w[0] < w[1]), "rungs must ascend");
+        assert_eq!(minzoom(), ZOOMS[0]);
+        assert_eq!(maxzoom(), ZOOMS[ZOOMS.len() - 1]);
+        assert!(
+            BACKGROUND_MAXZOOM >= minzoom(),
+            "no rung would carry the ground"
+        );
+        assert!(
+            ZOOMS.contains(&background_rung()),
+            "the fallback rung must exist"
+        );
+        assert!(background_rung() <= BACKGROUND_MAXZOOM);
+        assert_eq!(zooms_csv().split(',').count(), ZOOMS.len());
+    }
+
+    /// The one rule that decides what a deep rung costs: areal layers stop at
+    /// the cap, everything else is baked at every rung.
+    #[test]
+    fn background_layers_stop_at_the_cap_and_others_do_not() {
+        for layer in LAYERS {
+            for z in ZOOMS {
+                let expect = !is_background(layer) || z <= BACKGROUND_MAXZOOM;
+                assert_eq!(bakes(layer, z), expect, "{layer} at z{z}");
+            }
+        }
+        assert!(is_background("land") && is_background("landuse"));
+        assert!(!is_background("buildings"));
+        assert!(is_area("buildings") && !is_area("roads") && !is_area("places"));
+    }
+
+    /// A feature spanning `min_span` metres is exactly MIN_PIXELS wide at the
+    /// deepest rung; anything smaller can never be drawn, so the extractor
+    /// drops it. Check the arithmetic against the tile geometry it derives from.
+    #[test]
+    fn min_span_is_min_pixels_at_the_deepest_rung() {
+        let pixels_per_tile = 512.0;
+        let metres_per_pixel = tile_span(maxzoom()) / pixels_per_tile;
+        assert!((min_span() - MIN_PIXELS * metres_per_pixel).abs() < 1e-9);
+        assert!(
+            (tile_span(0) - 2.0 * WORLD).abs() < 1e-6,
+            "one tile is the world at z0"
+        );
+        assert!((tile_span(1) - WORLD).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sql_lists_are_quoted_and_escaped() {
+        assert_eq!(sql_list(&["a", "b'c"]), "'a', 'b''c'");
+        let sql = road_class_sql("highway");
+        assert!(sql.starts_with("CASE WHEN highway IN ("));
+        assert!(sql.contains("'motorway_link') THEN 'motorway'"));
+        assert!(sql.ends_with("ELSE 'other' END"));
+        // Every class named in ROAD_CLASSES gets an arm.
+        for (cls, ..) in ROAD_CLASSES {
+            assert!(sql.contains(&format!("THEN '{cls}'")), "{cls}");
+        }
+    }
+
+    /// Road minzooms are absolute but clamped to the rungs being built, so a
+    /// class worth drawing shallower than the first rung starts at the first
+    /// rung, and nothing asks for a zoom deeper than the last.
+    #[test]
+    fn road_minzooms_are_clamped_into_the_build() {
+        let sql = road_minzoom_sql("cls");
+        for (cls, _, mz) in ROAD_CLASSES {
+            let want = mz.clamp(minzoom(), maxzoom());
+            assert!(
+                sql.contains(&format!("WHEN '{cls}' THEN {want}")),
+                "{cls}: {sql}"
+            );
+        }
+        assert!(sql.ends_with(&format!("ELSE {} END", maxzoom())));
+    }
+
+    #[test]
+    fn area_minzoom_uses_the_texture_threshold_for_landuse_classes() {
+        let sql = area_minzoom_sql();
+        assert!(sql.contains(&format!("GREATEST({}", minzoom())));
+        for cls in LANDUSE_CLASSES {
+            assert!(
+                sql.contains(&format!("'{cls}'")),
+                "{cls} should get LANDUSE_PIXELS"
+            );
+        }
+        assert!(sql.contains(&format!("THEN {LANDUSE_PIXELS} ELSE {MIN_PIXELS} END")));
+    }
+}

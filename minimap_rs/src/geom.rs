@@ -13,8 +13,7 @@
 //! and what DuckDB is handed. The only Mercator arithmetic is the size filter,
 //! which has to happen in projected units to mean anything on screen.
 
-/// Half the width of the Web Mercator plane, in projected metres.
-pub const WORLD: f64 = 20037508.342789244;
+use crate::tuning::WORLD;
 
 pub type Pt = [f64; 2];
 
@@ -313,4 +312,223 @@ pub fn wkb_multipolygon(polys: &[Polygon]) -> Vec<u8> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Node "positions" for the assembly tests. Real ones are packed lat/lon
+    /// pairs; the assembler only compares them, so any distinct u64s will do.
+    fn way(ids: &[u64]) -> Vec<u64> {
+        ids.to_vec()
+    }
+
+    fn square(x0: f64, y0: f64, x1: f64, y1: f64) -> Ring {
+        Ring::new(vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]])
+    }
+
+    #[test]
+    fn a_closed_way_is_one_ring() {
+        let rings = assemble_rings(vec![way(&[1, 2, 3, 4, 1])]).unwrap();
+        assert_eq!(rings.len(), 1);
+        assert_eq!(rings[0].len(), 5, "closed: first node repeated");
+        assert_eq!(rings[0][0], rings[0][4]);
+    }
+
+    /// Two members meeting end to end, one of them walked the other way round
+    /// -- the ordinary multipolygon case, and the direction must not matter.
+    #[test]
+    fn open_ways_chain_into_a_ring_whatever_their_direction() {
+        let rings = assemble_rings(vec![way(&[1, 2, 3]), way(&[1, 4, 3])]).unwrap();
+        assert_eq!(rings.len(), 1);
+        let r = &rings[0];
+        assert_eq!(r.len(), 5);
+        assert_eq!(r[0], r[4]);
+        let mut corners = r[..4].to_vec();
+        corners.sort();
+        assert_eq!(corners, vec![1, 2, 3, 4]);
+    }
+
+    /// The bug this module exists to not have: two members that share a wall
+    /// describe one shape, not two. The shared segment 2-3 appears in both
+    /// squares and must cancel, leaving a single six-cornered outline.
+    #[test]
+    fn a_shared_wall_cancels_and_the_members_merge() {
+        let left = way(&[1, 2, 3, 4, 1]);
+        let right = way(&[2, 5, 6, 3, 2]);
+        let rings = assemble_rings(vec![left, right]).unwrap();
+        assert_eq!(
+            rings.len(),
+            1,
+            "nine adjacent outlines are one ring, not nine"
+        );
+        let r = &rings[0];
+        assert_eq!(r.len(), 7, "six corners plus the repeated first");
+        let mut corners = r[..6].to_vec();
+        corners.sort();
+        assert_eq!(corners, vec![1, 2, 3, 4, 5, 6]);
+        // The wall itself is gone: 2 and 3 are never consecutive.
+        let wall = r
+            .windows(2)
+            .any(|w| (w[0] == 2 && w[1] == 3) || (w[0] == 3 && w[1] == 2));
+        assert!(!wall, "the shared wall survived: {r:?}");
+    }
+
+    /// A member missing from the extract leaves an open chain. libosmium
+    /// reports that as a broken area and emits nothing; so do we.
+    #[test]
+    fn an_unclosable_relation_is_refused() {
+        assert!(assemble_rings(vec![way(&[1, 2, 3]), way(&[3, 4, 5])]).is_none());
+    }
+
+    /// Consecutive duplicate positions (two OSM nodes at one coordinate) are
+    /// not segments, and a "ring" of two points is not a ring.
+    #[test]
+    fn degenerate_input_produces_no_ring() {
+        assert_eq!(assemble_rings(vec![way(&[1, 1, 1])]).unwrap().len(), 0);
+        assert_eq!(assemble_rings(vec![way(&[1, 2, 1])]).unwrap().len(), 0);
+        assert_eq!(assemble_rings(vec![]).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn ring_area_is_signed_and_bbox_is_tight() {
+        let ccw = square(0.0, 0.0, 2.0, 1.0);
+        assert!((ccw.area - 2.0).abs() < 1e-12);
+        assert_eq!(ccw.bbox, [0.0, 0.0, 2.0, 1.0]);
+        let mut pts = ccw.pts.clone();
+        pts.reverse();
+        assert!(
+            (Ring::new(pts).area + 2.0).abs() < 1e-12,
+            "clockwise is negative"
+        );
+    }
+
+    /// Roles are never consulted: nesting is decided by containment, and a
+    /// ring inside a ring is a hole whichever order they arrive in.
+    #[test]
+    fn a_ring_inside_another_is_its_hole() {
+        for order in [[0, 1], [1, 0]] {
+            let rings: Vec<Ring> = order
+                .iter()
+                .map(|&i| {
+                    if i == 0 {
+                        square(0.0, 0.0, 10.0, 10.0)
+                    } else {
+                        square(2.0, 2.0, 4.0, 4.0)
+                    }
+                })
+                .collect();
+            let polys = classify(rings);
+            assert_eq!(polys.len(), 1);
+            assert_eq!(polys[0].len(), 2, "one outer, one hole");
+            assert!(polys[0][0].area > 0.0, "outer is counter-clockwise");
+            assert!(polys[0][1].area < 0.0, "hole is clockwise");
+            assert_eq!(polys[0][0].bbox, [0.0, 0.0, 10.0, 10.0]);
+        }
+    }
+
+    /// An island in a lake in an island: depth 2 is an outer ring again, so the
+    /// result is two polygons and not one with a bogus hole.
+    #[test]
+    fn nesting_alternates_outer_and_hole_by_depth() {
+        let polys = classify(vec![
+            square(0.0, 0.0, 10.0, 10.0),
+            square(1.0, 1.0, 9.0, 9.0),
+            square(4.0, 4.0, 6.0, 6.0),
+        ]);
+        assert_eq!(polys.len(), 2);
+        let big = polys
+            .iter()
+            .find(|p| p[0].bbox == [0.0, 0.0, 10.0, 10.0])
+            .unwrap();
+        let small = polys
+            .iter()
+            .find(|p| p[0].bbox == [4.0, 4.0, 6.0, 6.0])
+            .unwrap();
+        assert_eq!(big.len(), 2, "the lake is the island's hole");
+        assert_eq!(small.len(), 1, "the inner island is its own polygon");
+    }
+
+    /// Two disjoint rings are two polygons, and neither is a hole.
+    #[test]
+    fn disjoint_rings_are_separate_polygons() {
+        let polys = classify(vec![square(0.0, 0.0, 1.0, 1.0), square(5.0, 5.0, 6.0, 6.0)]);
+        assert_eq!(polys.len(), 2);
+        assert!(polys.iter().all(|p| p.len() == 1));
+    }
+
+    /// A hole that touches its outer ring at a vertex -- a lake reaching the
+    /// edge of its wood -- still counts as inside, because containment samples
+    /// several vertices rather than trusting one that sits on the boundary.
+    #[test]
+    fn a_hole_sharing_a_vertex_with_its_outer_is_still_inside() {
+        let outer = square(0.0, 0.0, 10.0, 10.0);
+        let inner = Ring::new(vec![
+            [0.0, 0.0],
+            [3.0, 1.0],
+            [3.0, 3.0],
+            [1.0, 3.0],
+            [0.0, 0.0],
+        ]);
+        let polys = classify(vec![outer, inner]);
+        assert_eq!(polys.len(), 1);
+        assert_eq!(polys[0].len(), 2);
+    }
+
+    #[test]
+    fn outer_span_is_the_projected_extent_of_the_outer_rings() {
+        // One degree of longitude at the equator is WORLD/180 metres.
+        let polys = classify(vec![square(0.0, 0.0, 1.0, 0.5)]);
+        let span = outer_span(&polys);
+        assert!((span - WORLD / 180.0).abs() < 1.0, "{span}");
+        assert_eq!(outer_span(&[]), 0.0);
+        // Holes do not count: the span is the outer ring's alone.
+        let with_hole = classify(vec![square(0.0, 0.0, 1.0, 0.5), square(0.2, 0.1, 0.3, 0.2)]);
+        assert!((outer_span(&with_hole) - span).abs() < 1e-6);
+    }
+
+    #[test]
+    fn mercator_y_is_odd_monotonic_and_clamped() {
+        assert!(mercator_y(0.0).abs() < 1e-6);
+        assert!((mercator_y(45.0) + mercator_y(-45.0)).abs() < 1e-6);
+        assert!(mercator_y(50.0) > mercator_y(49.0));
+        // The pole is clamped to the square plane rather than diverging.
+        assert!((mercator_y(90.0) - mercator_y(85.05)).abs() < 1e-6);
+        assert!((mercator_y(85.05) - WORLD).abs() < WORLD * 0.001);
+    }
+
+    fn u32_at(b: &[u8], p: usize) -> u32 {
+        u32::from_le_bytes(b[p..p + 4].try_into().unwrap())
+    }
+
+    fn f64_at(b: &[u8], p: usize) -> f64 {
+        f64::from_le_bytes(b[p..p + 8].try_into().unwrap())
+    }
+
+    /// The WKB layout DuckDB's ST_GeomFromWKB reads: little-endian marker, type,
+    /// counts, then coordinate pairs.
+    #[test]
+    fn wkb_layouts_match_the_spec() {
+        let line = wkb_linestring(&[[1.0, 2.0], [3.0, 4.0]]);
+        assert_eq!(line.len(), 1 + 4 + 4 + 2 * 16);
+        assert_eq!(line[0], 1, "little-endian");
+        assert_eq!(u32_at(&line, 1), 2, "LineString");
+        assert_eq!(u32_at(&line, 5), 2, "two points");
+        assert_eq!(f64_at(&line, 9), 1.0);
+        assert_eq!(f64_at(&line, 9 + 24), 4.0);
+
+        let polys = classify(vec![
+            square(0.0, 0.0, 10.0, 10.0),
+            square(2.0, 2.0, 4.0, 4.0),
+        ]);
+        let mp = wkb_multipolygon(&polys);
+        assert_eq!(u32_at(&mp, 1), 6, "MultiPolygon");
+        assert_eq!(u32_at(&mp, 5), 1, "one polygon");
+        assert_eq!(mp[9], 1);
+        assert_eq!(u32_at(&mp, 10), 3, "Polygon");
+        assert_eq!(u32_at(&mp, 14), 2, "two rings");
+        assert_eq!(u32_at(&mp, 18), 5, "five points in the outer ring");
+        assert_eq!(mp.len(), 9 + 9 + 2 * 4 + 10 * 16);
+    }
 }

@@ -26,6 +26,7 @@
 use std::time::Instant;
 
 use anon_format::{self as fmt, Record};
+use progress::Step;
 use rayon::slice::ParallelSliceMut;
 
 /// Grid the zones are cut on. Cells are `2^LEVEL` to a world side: at z19 that
@@ -68,28 +69,42 @@ const BLOCK: u32 = 64;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse(std::env::args().skip(1))?;
-    println!(
-        "level z{}, k = {}, from {}",
-        args.level,
-        args.tiers
-            .iter()
-            .map(u32::to_string)
-            .collect::<Vec<_>>()
-            .join(", "),
-        args.db.display()
+    if let Some(path) = &args.log {
+        progress::log_to(path)?;
+    }
+    let step = Step::start(
+        "anon",
+        format!(
+            "{} -> {}  (z{}, k = {})",
+            args.db.display(),
+            args.out.display(),
+            args.level,
+            args.tiers
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
     );
+    // Roughly how the wall clock divides, measured on Europe: the read is most
+    // of it, the sort and the cuts a little each. DuckDB gives no progress out
+    // of a single query, so the read is one tick and the bar's heartbeat is
+    // what says it is still alive.
+    progress::begin(1.0);
 
     let t0 = Instant::now();
+    progress::at("reading building footprints from features");
     let (mut cells, sites) = read_cells(&args)?;
+    progress::tick(0.55);
     if cells.is_empty() {
         return Err("no buildings matched -- wrong database, or a bbox off the data".into());
     }
     let buildings: u64 = cells.iter().map(|c| u64::from(c.buildings)).sum();
-    timed(
+    progress::timed(
         format!(
             "{} buildings in {} occupied cells, {:.1} per cell",
-            commas(buildings),
-            commas(cells.len() as u64),
+            progress::commas(buildings),
+            progress::commas(cells.len() as u64),
             buildings as f64 / cells.len() as f64
         ),
         t0,
@@ -98,13 +113,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Both of these run before the sort, while `sites` still lines up with
     // `cells`; after it, nothing needs a cell's position again.
     let t0 = Instant::now();
+    progress::at("measuring density");
     let windows = measure_density(&mut cells, &sites, args.level);
     let bounds = bounds_of(&sites, args.level);
     drop(sites);
-    timed(
+    progress::tick(0.10);
+    progress::timed(
         format!(
             "density measured over {} windows at z{DENSITY_LEVEL}",
-            commas(windows)
+            progress::commas(windows)
         ),
         t0,
     );
@@ -112,8 +129,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The one CPU-bound step. Hilbert order is the whole construction: after
     // this, a zone is a slice of the vector.
     let t0 = Instant::now();
+    progress::at("sorting into Hilbert order");
     cells.par_sort_unstable_by_key(|c| c.key);
-    timed("sorted into Hilbert order", t0);
+    progress::tick(0.10);
+    progress::timed("sorted into Hilbert order", t0);
 
     // Building-weighted, so this is the distribution as seen by a position being
     // anonymised rather than by a square kilometre of Europe -- which is mostly
@@ -131,36 +150,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             seen_by_building(&cells, |c| f64::from(c.built)),
         ),
     ] {
-        println!(
-            "  a building sees {what} p10 {:.1}, p50 {:.1}, p90 {:.1}, p99 {:.1} {unit}",
+        progress::line(format!(
+            "a building sees {what} p10 {:.1}, p50 {:.1}, p90 {:.1}, p99 {:.1} {unit}",
             pick(&seen, 0.10),
             pick(&seen, 0.50),
             pick(&seen, 0.90),
             pick(&seen, 0.99),
-        );
+        ));
     }
 
-    println!(
-        "  data bounds {:.3} {:.3} .. {:.3} {:.3}",
+    progress::line(format!(
+        "data bounds {:.3} {:.3} .. {:.3} {:.3}",
         bounds[0], bounds[1], bounds[2], bounds[3]
-    );
+    ));
 
     let mut tiers = Vec::new();
+    let per_tier = 0.15 / args.tiers.len() as f64;
     for &k in &args.tiers {
         let t0 = Instant::now();
+        progress::at(format!("cutting zones of k={k}"));
         let zones = fmt::cut(args.level, &cells, k);
-        timed(format!("k={k}: {} zones", commas(zones.len() as u64)), t0);
+        progress::tick(per_tier);
+        progress::timed(
+            format!("k={k}: {} zones", progress::commas(zones.len() as u64)),
+            t0,
+        );
         // The table the operator actually decides on: what k buys, by the kind of
         // place it is bought in. A single median over all zones hides the whole
         // point, since the countryside contributes most of the zones and none of
         // the population.
         for (kind, radii) in radii_by_kind(&zones, args.level) {
-            println!(
-                "    {kind:<12} {:>9} zones   radius p50 {:>6.0} m   p90 {:>6.0} m",
-                commas(radii.len() as u64),
+            progress::line(format!(
+                "  {kind:<12} {:>9} zones   radius p50 {:>6.0} m   p90 {:>6.0} m",
+                progress::commas(radii.len() as u64),
                 pick(&radii, 0.50),
                 pick(&radii, 0.90),
-            );
+            ));
         }
         tiers.push((k, zones));
     }
@@ -168,23 +193,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `encode` re-checks that each tier is a gapless, sorted, k-clearing
     // partition before it writes a byte. Cheap, and the failure it catches is a
     // privacy bug rather than a crash.
+    progress::at("encoding the index");
     let bytes = fmt::encode(args.level, BLOCK, bounds, &tiers)?;
     std::fs::write(&args.out, &bytes)?;
     let zones: usize = tiers.iter().map(|(_, z)| z.len()).sum();
-    println!(
-        "  {:.1} MB -> {} ({:.1} bytes a zone)",
-        bytes.len() as f64 / 1e6,
+    progress::end();
+    progress::line(format!(
+        "{} -> {} ({:.1} bytes a zone)",
+        progress::bytes(bytes.len() as u64),
         args.out.display(),
         bytes.len() as f64 / zones as f64,
-    );
+    ));
 
     // Prove the file answers, before anything is deployed against it.
     let ix = fmt::Index::parse(&bytes)?;
     let tier = ix.tier(None).expect("a tier was baked");
     let (lat, lon) = ((bounds[1] + bounds[3]) / 2.0, (bounds[0] + bounds[2]) / 2.0);
     if let Some(z) = ix.zone(&bytes, tier, lat, lon) {
-        println!("  centre of the data reads back as {}", z.to_json());
+        progress::line(format!("centre of the data reads back as {}", z.to_json()));
     }
+    step.done();
     Ok(())
 }
 
@@ -241,7 +269,7 @@ fn measure_density(cells: &mut [fmt::Bin], sites: &[Site], level: u32) -> u64 {
 /// The binning happens in SQL because it turns 121M rows into 35M and because the
 /// arithmetic has to match the pipeline's own -- `features` holds bounding boxes
 /// in projected metres, and these are the same two expressions
-/// `config::cell_sql` uses to place a feature on the tile grid.
+/// `tuning::cell_sql` uses to place a feature on the tile grid.
 fn read_cells(args: &Args) -> Result<(Vec<fmt::Bin>, Vec<Site>), Box<dyn std::error::Error>> {
     let con = connect(args)?;
     let span = 2.0 * fmt::WORLD / f64::from(1u32 << args.level);
@@ -384,27 +412,22 @@ struct Args {
     tiers: Vec<u32>,
     bbox: Option<[f64; 4]>,
     min_footprint: f64,
+    log: Option<std::path::PathBuf>,
 }
 
 impl Args {
     fn parse(args: impl Iterator<Item = String>) -> Result<Args, Box<dyn std::error::Error>> {
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .ancestors()
-            .nth(2)
-            .expect("anon/bake/ has two parents")
-            .to_path_buf();
+        // No default for either path: a build has a name (`make all
+        // NAME=...`), the database and the index carry it, and `make anon` is
+        // what knows it. Guessing here would silently pair the wrong two.
         let mut out = Args {
-            // Both defaults are `make`'s own paths: the database where the
-            // pipeline writes it, the index where `make anon`, `make serve` and
-            // `make clean` all expect it (and .gitignore already lists it).
-            db: std::env::var("MINIMAP_DB")
-                .map(Into::into)
-                .unwrap_or_else(|_| root.join("duckdb/minimap.duckdb")),
-            out: root.join("anon/anon-zones.bin"),
+            db: std::path::PathBuf::new(),
+            out: std::path::PathBuf::new(),
             level: LEVEL,
             tiers: TIERS.to_vec(),
             bbox: None,
             min_footprint: 0.0,
+            log: None,
         };
         let mut args = args.peekable();
         while let Some(flag) = args.next() {
@@ -415,15 +438,14 @@ impl Args {
                     println!(
                         "anon-bake -- cut the world into zones of k buildings (see anon/README.md)
 
-  --db PATH            the pipeline database (default {}, or $MINIMAP_DB)
-  --out PATH           where to write the index (default {})
+  --db PATH            the pipeline database, duckdb/<name>.duckdb   (required)
+  --out PATH           where to write the index                     (required)
   --k LIST             tiers to bake, comma separated (default {})
   --level Z            grid the zones are cut on (default {LEVEL})
   --bbox W S E N       only buildings inside a lon/lat box, for a quick look
   --min-footprint M2   drop buildings smaller than M2 square metres -- the
-                       sheds and barns that inflate a hamlet's count",
-                        out.db.display(),
-                        out.out.display(),
+                       sheds and barns that inflate a hamlet's count
+  --log FILE           also write the durable lines here",
                         TIERS
                             .iter()
                             .map(u32::to_string)
@@ -436,6 +458,7 @@ impl Args {
                 "--out" => out.out = next()?.into(),
                 "--level" => out.level = next()?.parse()?,
                 "--min-footprint" => out.min_footprint = next()?.parse()?,
+                "--log" => out.log = Some(next()?.into()),
                 "--k" => {
                     out.tiers = next()?
                         .split(',')
@@ -465,6 +488,9 @@ impl Args {
         }
         if out.tiers.is_empty() || out.tiers.iter().any(|&k| k < 2) {
             return Err("--k wants at least one value, each >= 2".into());
+        }
+        if out.db.as_os_str().is_empty() || out.out.as_os_str().is_empty() {
+            return Err("--db and --out are required -- `make anon` passes both".into());
         }
         // Sorted so `Index::tier(None)` and the log read the same way.
         out.tiers.sort_unstable();
@@ -533,24 +559,4 @@ fn connect(args: &Args) -> Result<duckdb::Connection, Box<dyn std::error::Error>
         con.execute_batch(&format!("SET memory_limit = '{limit}'"))?;
     }
     Ok(con)
-}
-
-fn timed(msg: impl AsRef<str>, since: Instant) {
-    println!(
-        "  {}  ({:.1}s)",
-        msg.as_ref(),
-        since.elapsed().as_secs_f64()
-    );
-}
-
-fn commas(n: u64) -> String {
-    let s = n.to_string();
-    let mut out = String::new();
-    for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
-            out.push(' ');
-        }
-        out.push(c);
-    }
-    out
 }

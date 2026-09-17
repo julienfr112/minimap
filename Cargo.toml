@@ -15,6 +15,7 @@
 # `anon-format` is the ~200 lines they both have to agree on byte for byte.
 [workspace]
 members = [
+    "progress",
     "minimap_rs",
     "server",
     "anon/format",

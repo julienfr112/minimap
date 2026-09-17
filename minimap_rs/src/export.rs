@@ -15,9 +15,11 @@
 //! archive has its own etag.
 //!
 //! The price is a request per layer per tile instead of one, and about ten
-//! percent more bytes from gzipping each layer separately. PMTiles is used as the on-disk format even though we serve it
-//! ourselves, because it already provides exactly what a small,
-//! memory-constrained server needs and what measurement showed matters:
+//! percent more bytes from gzipping each layer separately.
+//!
+//! PMTiles is used as the on-disk format even though we serve it ourselves,
+//! because it already provides exactly what a small, memory-constrained server
+//! needs and what measurement showed matters:
 //!
 //!   * tiles ordered along a Hilbert curve, so the tiles of one viewport are
 //!     physically adjacent -- measured 112 us -> 1.2 us for adjacent vs random
@@ -36,9 +38,9 @@ use std::io::Write;
 use duckdb::Connection;
 use pmtiles::{Compression, Compressor, PmTilesWriter, PmtResult, TileCoord, TileId, TileType};
 
-use crate::config::Config;
+use crate::config::{split_archive_name, Config};
 use crate::tuning::LAYERS;
-use crate::progress::{self, Step};
+use progress::Step;
 
 type Error = Box<dyn std::error::Error>;
 
@@ -75,9 +77,16 @@ pub fn run(cfg: &Config, con: &Connection) -> Result<(), Error> {
         })
         .map_err(|_| "no `meta` table -- run `make bake` first")?;
 
-    let dir = cfg.tiles_dir();
-    std::fs::create_dir_all(&dir)?;
-    let step = Step::start("export", format!("one archive per layer -> {}", dir.display()));
+    let dir = &cfg.pmtiles;
+    std::fs::create_dir_all(dir)?;
+    let step = Step::start(
+        "export",
+        format!(
+            "one archive per layer -> {}/{}.<layer>.pmtiles",
+            dir.display(),
+            cfg.name
+        ),
+    );
 
     // Only the layers that actually produced tiles. A layer with nothing in it
     // gets no archive at all, which is how the viewer learns it is absent --
@@ -99,13 +108,14 @@ pub fn run(cfg: &Config, con: &Connection) -> Result<(), Error> {
         return Err("no tiles to export -- run `make bake` first".into());
     }
 
-    // Stale archives from a build with more layers than this one would otherwise
-    // sit in the directory and be served.
-    for entry in std::fs::read_dir(&dir)?.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if let Some(stem) = name.strip_suffix(".pmtiles") {
-            if !layers.iter().any(|l| *l == stem) {
-                progress::line(format!("removing stale {name}"));
+    // Stale archives from an earlier run of *this* build with more layers than
+    // this one would otherwise sit in the directory and be served. Other
+    // builds' archives share the directory and are not touched.
+    for entry in std::fs::read_dir(dir)?.flatten() {
+        let file = entry.file_name().to_string_lossy().into_owned();
+        if let Some((build, layer)) = split_archive_name(&file) {
+            if build == cfg.name && !layers.contains(&layer) {
+                progress::line(format!("removing stale {file}"));
                 let _ = std::fs::remove_file(entry.path());
             }
         }
@@ -176,7 +186,9 @@ fn one(
     // PMTiles wants tiles in ascending TileId, which is Hilbert order and has no
     // cheap SQL spelling. Rather than pull every blob into memory to sort them
     // -- fine for a region, 20 GB for Europe -- compute the ids here, hand them
-    // back to DuckDB, and let it do the sort it is good at.
+    // back to DuckDB, and let it do the sort it is good at. Minutes on Europe's
+    // roads (85M tiles), so the bar says what it is doing meanwhile.
+    progress::at(format!("{layer} computing Hilbert order"));
     let mut stmt = con.prepare("SELECT z, x, y FROM tile_layers WHERE layer = ?")?;
     let coords: Vec<(u8, u32, u32)> = stmt
         .query_map([layer], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
@@ -188,12 +200,23 @@ fn one(
     )?;
     {
         let mut appender = con.appender("tile_order")?;
-        for &(z, x, y) in &coords {
+        for (i, &(z, x, y)) in coords.iter().enumerate() {
             let id: TileId = TileCoord::new(z, x, y)?.into();
             appender.append_row(duckdb::params![z, x, y, id.value()])?;
+            if i % 1_000_000 == 0 {
+                progress::at(format!(
+                    "{layer} ordering {} / {} tiles",
+                    progress::commas(i as u64),
+                    progress::commas(coords.len() as u64)
+                ));
+            }
         }
         appender.flush()?;
     }
+    progress::at(format!(
+        "{layer} sorting {} tiles",
+        progress::commas(coords.len() as u64)
+    ));
 
     // Written beside the archive and renamed onto it only once it is complete.
     // Creating the archive in place truncates it before the first tile is
@@ -237,6 +260,9 @@ fn one(
         writer.add_tile(TileCoord::new(z, x, y)?, &data)?;
         count += 1;
     }
+    // The directory -- one entry per tile, delta-coded and gzipped -- is
+    // written last, and for a big layer it is a visible pause.
+    progress::at(format!("{layer} writing the directory"));
     writer.finalize()?;
     std::fs::rename(&tmp, &out)?;
     con.execute_batch("DROP TABLE tile_order")?;

@@ -38,9 +38,9 @@ use duckdb::Connection;
 
 use crate::config::{Config, Region};
 use crate::extract;
-use crate::progress::{self, Step};
 use crate::rows::RawTable;
 use crate::tuning::{self, WORLD};
+use progress::Step;
 
 type Error = Box<dyn std::error::Error>;
 
@@ -109,7 +109,13 @@ pub fn run(cfg: &Config, con: &Connection, regions: &[Region]) -> Result<(), Err
             tuning::RAW_DDL
         ))?;
         let mut sink = RawTable::new(con.appender("raw")?);
-        extract::run(&region.path, &mut sink, tuning::min_span(), &region.name, parse)?;
+        extract::run(
+            &region.path,
+            &mut sink,
+            tuning::min_span(),
+            &region.name,
+            parse,
+        )?;
         let n = sink.finish()?;
         progress::timed(
             format!("{prefix} staged {} objects", progress::commas(n)),
@@ -208,7 +214,13 @@ pub fn places(con: &Connection, regions: &[Region], weight: f64) -> Result<(), E
              (name VARCHAR, kind VARCHAR, population BIGINT, lon DOUBLE, lat DOUBLE)",
     )?;
     let mut total = 0usize;
-    for region in regions {
+    for (i, region) in regions.iter().enumerate() {
+        progress::at(format!(
+            "scanning {} for place labels ({}/{})",
+            region.name,
+            i + 1,
+            regions.len()
+        ));
         let found = extract::scan_places(&region.path)?;
         let mut appender = con.appender("raw_places")?;
         for p in &found {
@@ -305,9 +317,7 @@ pub fn places(con: &Connection, regions: &[Region], weight: f64) -> Result<(), E
 /// already hoisting them.)
 pub fn subdivide(con: &Connection, layer: &str, weight: f64) -> Result<(), Error> {
     let marker: i64 = con.query_row(
-        &format!(
-            "SELECT count(*) FROM duckdb_tables() WHERE table_name = '{layer}_subdivided'"
-        ),
+        &format!("SELECT count(*) FROM duckdb_tables() WHERE table_name = '{layer}_subdivided'"),
         [],
         |r| r.get(0),
     )?;
@@ -354,7 +364,10 @@ pub fn subdivide(con: &Connection, layer: &str, weight: f64) -> Result<(), Error
         if n == 0 {
             break;
         }
-        progress::at(format!("subdividing {layer}: {} pieces still oversized", progress::commas(n as u64)));
+        progress::at(format!(
+            "subdividing {layer}: {} pieces still oversized",
+            progress::commas(n as u64)
+        ));
         con.execute_batch(&format!(
             r#"
             CREATE OR REPLACE TABLE split_src AS
@@ -415,9 +428,7 @@ pub fn subdivide(con: &Connection, layer: &str, weight: f64) -> Result<(), Error
     ))?;
     con.execute_batch("DROP TABLE layer_sub; CHECKPOINT")?;
     let (n, verts): (i64, i64) = con.query_row(
-        &format!(
-            "SELECT count(*), max(ST_NPoints(geom)) FROM features WHERE layer = '{layer}'"
-        ),
+        &format!("SELECT count(*), max(ST_NPoints(geom)) FROM features WHERE layer = '{layer}'"),
         [],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
@@ -629,7 +640,10 @@ mod tests {
             )
             .unwrap();
         assert!(n > 100, "monster should shatter into many pieces, got {n}");
-        assert!((area - 2_500_000_000.0 - 10_000.0).abs() < 1.0, "area must be conserved, got {area}");
+        assert!(
+            (area - 2_500_000_000.0 - 10_000.0).abs() < 1.0,
+            "area must be conserved, got {area}"
+        );
         assert_eq!(small, 1, "the small polygon passes through whole");
         // Every piece keeps its parent's minzoom.
         let z10: i64 = con
@@ -641,9 +655,7 @@ mod tests {
             .unwrap();
         assert_eq!(z10, n - 1);
         // Bisection ran to completion: no piece straddles a cell boundary.
-        let span = tuning::tile_span(
-            tuning::maxzoom().saturating_sub(3).max(tuning::minzoom()),
-        );
+        let span = tuning::tile_span(tuning::maxzoom().saturating_sub(3).max(tuning::minzoom()));
         let w = tuning::WORLD;
         let oversized: i64 = con
             .query_row(
@@ -660,7 +672,11 @@ mod tests {
         // Idempotent: the marker makes a second call a no-op.
         subdivide(&con, "water", 0.0).unwrap();
         let again: i64 = con
-            .query_row("SELECT count(*) FROM features WHERE layer = 'water'", [], |r| r.get(0))
+            .query_row(
+                "SELECT count(*) FROM features WHERE layer = 'water'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(again, n);
     }

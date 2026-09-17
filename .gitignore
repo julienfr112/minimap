@@ -19,7 +19,8 @@ build/
 *.duckdb.tmp/
 *.pmtiles
 *.log
-anon/anon-zones.bin
+*.log.*
+anon/*.anon-zones.bin
 
 # Rust build output
 target/

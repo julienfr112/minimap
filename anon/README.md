@@ -8,7 +8,7 @@ A parallel service to the tile pipeline, built on the same idea and the same
 serve is a lookup.
 
 ```
-DuckDB `features`  --anon-bake-->  anon-zones.bin  --anon-serve-->  HTTP
+DuckDB `features`  --anon-bake-->  <name>.anon-zones.bin  --anon-serve-->  HTTP
 236.8M buildings    Hilbert cut     15.8M zones     binary search    one JSON
 90s, 3 tiers of k   4.5 B a zone    + one block scan no geometry code
                     70.3 MB, all of Europe

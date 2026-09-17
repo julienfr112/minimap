@@ -11,7 +11,6 @@
 //! this pipeline invented no opinion about, like GEOMETRY.
 
 use crate::config::Config;
-use crate::progress;
 
 type Error = Box<dyn std::error::Error>;
 
@@ -33,7 +32,15 @@ pub fn run(cfg: &Config, query: &str) -> Result<(), Error> {
         .to_ascii_lowercase();
     let reads = matches!(
         word.as_str(),
-        "select" | "with" | "from" | "describe" | "summarize" | "show" | "pragma" | "table" | "explain"
+        "select"
+            | "with"
+            | "from"
+            | "describe"
+            | "summarize"
+            | "show"
+            | "pragma"
+            | "table"
+            | "explain"
     );
 
     let con = cfg.connect(!reads)?;
@@ -47,7 +54,9 @@ pub fn run(cfg: &Config, query: &str) -> Result<(), Error> {
     // `COLUMNS(*)` applies the cast to every column at once and keeps the
     // names, so this works for any shape of result without naming anything.
     let t0 = std::time::Instant::now();
-    let mut stmt = con.prepare(&format!("SELECT CAST(COLUMNS(*) AS VARCHAR) FROM ({query})"))?;
+    let mut stmt = con.prepare(&format!(
+        "SELECT CAST(COLUMNS(*) AS VARCHAR) FROM ({query})"
+    ))?;
     let mut rows = stmt.query([])?;
 
     let mut table: Vec<Vec<String>> = Vec::new();

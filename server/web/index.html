@@ -2,6 +2,10 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
+  <!-- Rewritten by the server to the prefix this page was reached under, so
+       every relative URL below (minimap.js, meta.json, tiles/...) resolves
+       there whether the map lives at / or is nested at /map. -->
+  <base href="/">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>minimap - Hauts-de-France</title>
   <style>
@@ -42,8 +46,7 @@
   <div class="panel" id="help">drag to pan · scroll to zoom</div>
   <div class="panel" id="zone" hidden></div>
   <div class="panel" id="attribution"></div>
-  <!-- Relative, so the same shell works at / and nested under a prefix; the
-       server guarantees the page URL ends in a slash. -->
+  <!-- Relative to the <base> above. -->
   <script src="minimap.js"></script>
 </body>
 </html>

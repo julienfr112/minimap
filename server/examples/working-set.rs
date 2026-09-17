@@ -6,7 +6,8 @@
 //! the map: it lands on a few dozen city centres, and those centres are a tiny
 //! fraction of a 29 GB archive. This measures that fraction.
 //!
-//!   make working-set
+//!   make working-set                             the build `make` would serve
+//!   make working-set NAME=picardie               another build in the same directory
 //!   make working-set WHERE="Paris Berlin"        only these, by name
 //!   make working-set WHERE="35.68,139.69,Tokyo"  somewhere the list never heard of
 //!
@@ -80,27 +81,48 @@ const CITIES: [(&str, f64, f64); 24] = [
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // working-set <pmtiles dir> <build name> [place ...]
     let mut args = std::env::args().skip(1);
     let dir = PathBuf::from(args.next().unwrap_or_else(|| "pmtiles".into()));
+    let build = args
+        .next()
+        .ok_or("usage: working-set <pmtiles dir> <build name> [place ...]")?;
     let places = places(args.collect())?;
 
-    // One archive per layer, in whatever the build produced.
+    // One archive per layer of the named build; other builds share the
+    // directory and are left alone.
     let mut layers: BTreeMap<String, Archive> = BTreeMap::new();
     for entry in std::fs::read_dir(&dir)
         .map_err(|e| format!("{}: {e} -- run `make all` first", dir.display()))?
         .flatten()
     {
         let file = entry.file_name().to_string_lossy().into_owned();
-        if let Some(name) = file.strip_suffix(".pmtiles") {
-            layers.insert(name.to_string(), Archive::open(&entry.path())?);
+        let Some((name, layer)) = file
+            .strip_suffix(".pmtiles")
+            .and_then(|stem| stem.split_once('.'))
+        else {
+            continue;
+        };
+        if name == build {
+            layers.insert(layer.to_string(), Archive::open(&entry.path())?);
         }
     }
     if layers.is_empty() {
-        return Err(format!("no .pmtiles in {}", dir.display()).into());
+        let there = minimap_server::builds(&dir).unwrap_or_default();
+        return Err(format!(
+            "no build called {build:?} in {} -- there: {}",
+            dir.display(),
+            if there.is_empty() {
+                "nothing".to_string()
+            } else {
+                there.join(", ")
+            }
+        )
+        .into());
     }
 
     let total: u64 = layers.values().map(|a| a.tile_count).sum();
-    println!(
+    progress::line(format!(
         "{} layers, {} tiles: {}",
         layers.len(),
         thousands(total),
@@ -109,28 +131,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(|(n, a)| format!("{n} z{}..{}", a.min_zoom, a.max_zoom))
             .collect::<Vec<_>>()
             .join(", ")
-    );
+    ));
+
+    // Every lookup below is a directory read, and on a cold archive a page
+    // fault each; a continent's worth is a minute of them. The shallow rungs
+    // are about as much work as a couple of cities, so they weigh two.
+    progress::begin(places.len() as f64 + 2.0);
 
     // The shallow rungs are one working set for everybody: whoever loads the
     // map anywhere pulls them in, and they never leave.
+    progress::at("summing every rung up to z12");
     let mut shared = 0u64;
     for a in layers.values() {
         for z in a.min_zoom..=12.min(a.max_zoom) {
             shared += whole_rung(a, z);
         }
     }
-    println!(
+    progress::tick(2.0);
+    progress::line(format!(
         "shared by every user (every rung up to z12): {}\n",
         bytes(shared)
-    );
+    ));
 
-    println!(
+    progress::line(format!(
         "{:<12} {:>12} {:>12} {:>12}   first screenful at z{CITY_RUNG}",
         "city",
         format!("z{CITY_RUNG} {}x{} km", CITY_KM * 2.0, CITY_KM * 2.0),
         format!("z{METRO_RUNG} {}x{} km", METRO_KM * 2.0, METRO_KM * 2.0),
         "both",
-    );
+    ));
 
     let mut running = shared;
     let mut counted = 0usize;
@@ -143,9 +172,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !layers.values().any(|a| {
             *lon >= a.min_lon && *lon <= a.max_lon && *lat >= a.min_lat && *lat <= a.max_lat
         }) {
-            println!("{name:<12} outside the archive's bounds -- not in this build");
+            progress::line(format!(
+                "{name:<12} outside the archive's bounds -- not in this build"
+            ));
+            progress::tick(1.0);
             continue;
         }
+        progress::at(format!("measuring {name}"));
 
         let (mut city, mut metro, mut screen) = (0u64, 0u64, 0u64);
         for (layer, a) in &layers {
@@ -162,14 +195,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         running += city + metro;
         counted += 1;
-        println!(
+        progress::tick(1.0);
+        progress::line(format!(
             "{name:<12} {:>12} {:>12} {:>12}   {}",
             bytes(city),
             bytes(metro),
             bytes(city + metro),
             bytes(screen),
-        );
+        ));
     }
+    progress::end();
 
     let city_bytes: u64 = per_layer.values().sum();
     if city_bytes > 0 {
@@ -222,7 +257,11 @@ fn places(args: Vec<String>) -> Result<Vec<(String, f64, f64)>, String> {
                         format!(
                             "no city called {name}. Known: {}. Anywhere else is \
                              `lat,lon` or `lat,lon,Name`.",
-                            CITIES.iter().map(|(n, ..)| *n).collect::<Vec<_>>().join(", ")
+                            CITIES
+                                .iter()
+                                .map(|(n, ..)| *n)
+                                .collect::<Vec<_>>()
+                                .join(", ")
                         )
                     })?;
                 out.push((found.0.to_string(), found.1, found.2));
@@ -241,7 +280,11 @@ fn places(args: Vec<String>) -> Result<Vec<(String, f64, f64)>, String> {
                 };
                 out.push((name, lat, lon));
             }
-            _ => return Err(format!("{arg}: expected a name, `lat,lon`, or `lat,lon,Name`")),
+            _ => {
+                return Err(format!(
+                    "{arg}: expected a name, `lat,lon`, or `lat,lon,Name`"
+                ))
+            }
         }
     }
     Ok(out)

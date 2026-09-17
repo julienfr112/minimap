@@ -1,4 +1,5 @@
-//! One output format for the whole pipeline, and one answer to "how long?".
+//! One output format for every long-running program here, and one answer to
+//! "how long?".
 //!
 //! These steps run for minutes to hours, and the two audiences for their output
 //! want opposite things: a terminal wants a line that overwrites itself, a log
@@ -278,13 +279,13 @@ impl Step {
         }
     }
 
-    pub fn elapsed(&self) -> Duration {
-        self.t0.elapsed()
-    }
-
     pub fn done(self) {
         end();
-        emit(&format!("<== {}  ok  {}", self.name, secs(self.t0.elapsed())));
+        emit(&format!(
+            "<== {}  ok  {}",
+            self.name,
+            secs(self.t0.elapsed())
+        ));
         let _ = std::io::stdout().flush();
     }
 }
@@ -300,7 +301,13 @@ pub fn line(msg: impl AsRef<str>) {
 /// page, which is the only way to see at a glance which region or which zoom is
 /// the one costing the money.
 pub fn timed(msg: impl AsRef<str>, since: Instant) {
-    around(|| emit(&format!("    {:<58} {:>9}", msg.as_ref(), secs(since.elapsed()))));
+    around(|| {
+        emit(&format!(
+            "    {:<58} {:>9}",
+            msg.as_ref(),
+            secs(since.elapsed())
+        ))
+    });
 }
 
 /// `[ 3/49] name` — the prefix for per-item lines, so a long run always says
@@ -425,4 +432,84 @@ pub fn commas(n: u64) -> String {
         out.push(c);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sizes_read_the_way_people_say_them() {
+        assert_eq!(bytes(0), "0 B");
+        assert_eq!(bytes(1023), "1023 B");
+        assert_eq!(bytes(1024), "1.0 kB");
+        assert_eq!(bytes(1536), "1.5 kB");
+        assert_eq!(bytes(78_500_000), "74.9 MB");
+        assert_eq!(bytes(154 << 30), "154.0 GB");
+        assert_eq!(bytes(3 << 40), "3.0 TB");
+    }
+
+    #[test]
+    fn durations_switch_units_at_a_minute_and_an_hour() {
+        assert_eq!(secs(Duration::from_millis(1234)), "1.2s");
+        assert_eq!(secs(Duration::from_secs(59)), "59.0s");
+        assert_eq!(secs(Duration::from_secs(60)), "1m 00s");
+        assert_eq!(secs(Duration::from_secs(4523)), "1h 15m");
+        assert_eq!(secs(Duration::from_secs(36 * 3600 + 59)), "36h 00m");
+    }
+
+    #[test]
+    fn thousands_are_separated() {
+        assert_eq!(commas(0), "0");
+        assert_eq!(commas(999), "999");
+        assert_eq!(commas(1000), "1,000");
+        assert_eq!(commas(1_034_854), "1,034,854");
+        assert_eq!(commas(u64::MAX), "18,446,744,073,709,551,615");
+    }
+
+    #[test]
+    fn labels_are_clipped_to_the_column() {
+        assert_eq!(clip("short", 10), "short");
+        assert_eq!(clip("exactly ten", 11), "exactly ten");
+        assert_eq!(clip("a rather long label", 8), "a rathe…");
+        assert_eq!(clip("héhé", 3), "hé…", "counts characters, not bytes");
+    }
+
+    #[test]
+    fn item_prefix_pads_to_the_count() {
+        assert_eq!(item(0, 9, "x"), "[1/9] x                 ");
+        assert_eq!(item(2, 49, "france"), "[ 3/49] france            ");
+    }
+
+    /// The bar's arithmetic: fraction clamps, and the ETA declines to guess
+    /// until a few percent are in.
+    #[test]
+    fn eta_declines_to_guess_too_early() {
+        let mut t = Task {
+            total: 100.0,
+            done: 0.0,
+            what: String::new(),
+            t0: Instant::now(),
+            last: Instant::now(),
+            shown: -1,
+            beat: Instant::now(),
+            visible: false,
+        };
+        assert_eq!(t.eta(), "estimating");
+        t.done = 50.0;
+        assert!(
+            t.eta().starts_with('~') && t.eta().ends_with(" left"),
+            "{}",
+            t.eta()
+        );
+        t.done = 150.0;
+        assert_eq!(
+            t.fraction(),
+            1.0,
+            "over-reporting clamps rather than overflowing"
+        );
+        assert_eq!(t.eta(), "finishing");
+        t.total = 0.0;
+        assert_eq!(t.fraction(), 0.0, "an empty task is not a division by zero");
+    }
 }

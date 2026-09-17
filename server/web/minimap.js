@@ -258,6 +258,10 @@ const ZONE_EDGE = 'rgba(192, 57, 43, 0.85)';
 // press-and-release that travelled less than this many pixels.
 const CLICK_SLOP = 4;
 
+// How long a tile whose fetch *failed* (as opposed to came back empty) is
+// left alone before it is asked for again.
+const RETRY_MS = 5000;
+
 // Margin left around whatever `fit` was asked to frame, in CSS pixels.
 const FIT_PAD = 24;
 
@@ -303,8 +307,8 @@ function unproject(x, y) {
 /// `base` is the other kind of option: where the server is, rather than what
 /// the viewer does. Empty means every request is relative to the document,
 /// which is what the standalone shell wants -- it *is* served by that server,
-/// and the trailing-slash redirect exists so `tiles/...` resolves under the
-/// nest prefix whatever it is.
+/// and its `<base href>` is set so `tiles/...` resolves under the nest prefix
+/// whatever it is.
 ///
 /// An application that embeds the map in pages of its own has no such luck: a
 /// viewer on `/calendar` asking for `tiles/...` asks `/calendar/tiles/...`, and
@@ -677,10 +681,11 @@ class Minimap {
     this.tiles.set(key, 'loading');
     this.pending++;
     // Relative by default, like every request this file makes: the server
-    // redirects the shell to a trailing-slash URL, so these resolve correctly
-    // whether the map lives at / or nested under /map/ of some larger
-    // application. `base` is for the other case -- a viewer embedded in a page
-    // of the host's own, where relative means relative to *that* page.
+    // serves the shell with a <base href> naming its own prefix, so these
+    // resolve correctly whether the map lives at / or nested under /map of
+    // some larger application. `base` is for the other case -- a viewer
+    // embedded in a page of the host's own, where relative means relative to
+    // *that* page.
     fetch(`${this.opts.base}tiles/${name}/${z}/${x}/${y}`)
       .then((r) => {
         if (r.status === 204 || r.status === 404) return null;
@@ -693,8 +698,14 @@ class Minimap {
         this.#keep(key, layers.length ? layers[0] : 'empty');
       })
       .catch((err) => {
+        // A network hiccup or a 5xx is not an absence. Hold the slot as empty
+        // so the frame loop does not hammer a failing server, then forget it
+        // so the next frame after the pause asks again.
         console.warn('tile', key, err);
         this.#keep(key, 'empty');
+        setTimeout(() => {
+          if (this.tiles.get(key) === 'empty') { this.tiles.delete(key); this.dirty = true; }
+        }, RETRY_MS);
       })
       .finally(() => { this.pending--; this.dirty = true; onStatus(this); });
     return null;
@@ -1208,7 +1219,9 @@ let onStatus = () => {};
 let onZone = () => {};
 
 async function main() {
-  const meta = await (await fetch('meta.json')).json();
+  const res = await fetch('meta.json');
+  if (!res.ok) throw new Error(`meta.json: ${res.status}`);
+  const meta = await res.json();
   const canvas = document.getElementById('map');
   const map = new Minimap(canvas, meta);
 
@@ -1222,7 +1235,10 @@ async function main() {
     clearTimeout(hashTimer);
     hashTimer = setTimeout(() => {
       const h = `#${m.zoom}/${m.center.lat.toFixed(5)}/${m.center.lon.toFixed(5)}`;
-      if (location.hash !== h) history.replaceState(null, '', h);
+      // The full path, not the bare fragment: a relative URL here would
+      // resolve against the page's <base>, which is the map's prefix and not
+      // necessarily the page's own address.
+      if (location.hash !== h) history.replaceState(null, '', location.pathname + location.search + h);
     }, 300);
   };
   onStatus(map);
@@ -1250,15 +1266,22 @@ async function main() {
 // The class is the library; `main` is the standalone page built on it. Another
 // application loads this same file, finds no shell to boot, and constructs its
 // own maps -- which is why every reach outside the canvas above is an option.
-window.Minimap = Minimap;
-window.minimapProject = project;
-window.minimapUnproject = unproject;
+//
+// Under node (`make test` runs minimap.test.js) there is no window at all: the
+// decoder is exported and nothing else runs.
+if (typeof window !== 'undefined') {
+  window.Minimap = Minimap;
+  window.minimapProject = project;
+  window.minimapUnproject = unproject;
 
-// `#hud` rather than `#map`: an embedding may well have a canvas of its own by
-// that id (and the shell's ids are the ones `main` actually needs).
-if (document.getElementById('hud')) {
-  main().catch((e) => {
-    document.getElementById('hud').textContent = 'error: ' + e.message;
-    console.error(e);
-  });
+  // `#hud` rather than `#map`: an embedding may well have a canvas of its own
+  // by that id (and the shell's ids are the ones `main` actually needs).
+  if (document.getElementById('hud')) {
+    main().catch((e) => {
+      document.getElementById('hud').textContent = 'error: ' + e.message;
+      console.error(e);
+    });
+  }
+} else if (typeof module !== 'undefined') {
+  module.exports = { Reader, decodeTile, decodeGeometry, project, unproject };
 }

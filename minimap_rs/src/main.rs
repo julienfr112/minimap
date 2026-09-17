@@ -2,10 +2,10 @@
 //!
 //! ```text
 //! download -> load -> bake -> export
-//!   download   fetch the .osm.pbf extracts and the coastline into data/
+//!   download   fetch the .osm.pbf extracts and the coastline into pbf/
 //!   load       parse them into a DuckDB `features` table (EPSG:3857)
 //!   bake       clip/simplify/encode every feature into MVT tiles
-//!   export     pack the tiles into one PMTiles archive to ship to the server
+//!   export     pack the tiles into one PMTiles archive per layer
 //! ```
 //!
 //! Everything geometric happens once, here, offline, in DuckDB SQL. What
@@ -20,7 +20,7 @@
 //! the list.
 
 use minimap::config::Config;
-use minimap::{bake, download, export, info, load, progress, sql, tuning};
+use minimap::{bake, download, export, info, load, sql, tuning};
 
 /// See the note on the dependency in Cargo.toml: this is worth ~2x on the bake,
 /// because it replaces the allocator DuckDB's C++ uses, not just Rust's.
@@ -37,13 +37,15 @@ commands
   download   fetch extracts (and --land) into <pbf>
   load       PBF -> DuckDB `features`
   bake       `features` -> MVT tiles
-  export     tiles -> PMTiles archive
-  all        load, bake, export
+  export     tiles -> one PMTiles archive per layer
   info       what is in the build right now
   regions    what Geofabrik publishes, and what is already here
   sql QUERY  ask the build database something
 
 options
+  --name NAME     what this build is called; prefixes the database, the logs
+                  and the archives (<name>.<layer>.pmtiles)
+                                                 [the regions joined by +, or all]
   --pbf DIR       the extracts, never cleaned    [pbf]
   --duckdb DIR    the build database and spill    [duckdb]
   --pmtiles DIR   the archives, one per layer     [pmtiles]
@@ -55,7 +57,7 @@ options
   -h, --help
 
 REGION is a Geofabrik id (picardie, france, belgium). `minimap regions` lists
-them. For load/bake/export, naming none means every extract under <pbf>.
+them. For load, naming none means every extract under <pbf>.
 
 The zoom rungs and the size thresholds are not flags: they are what this map is,
 and they live in minimap_rs/src/tuning.rs. Editing that file makes `make` re-run
@@ -77,6 +79,7 @@ fn run() -> Result<(), Error> {
     let mut land = false;
     let mut europe = false;
     let mut log: Option<std::path::PathBuf> = None;
+    let mut name: Option<String> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -92,6 +95,7 @@ fn run() -> Result<(), Error> {
                 println!("\nthis build bakes rungs z{}", tuning::zooms_csv());
                 return Ok(());
             }
+            "--name" => name = Some(value("--name")?),
             "--pbf" => cfg.pbf = value("--pbf")?.into(),
             "--duckdb" => cfg.duckdb = value("--duckdb")?.into(),
             "--pmtiles" => cfg.pmtiles = value("--pmtiles")?.into(),
@@ -112,6 +116,27 @@ fn run() -> Result<(), Error> {
         println!("{USAGE}");
         return Ok(());
     };
+    // The same default `make` computes for a named build, so one made by hand
+    // and one made by make land under the same name. With nothing named --
+    // every extract under <pbf> -- the two differ on purpose: make's `europe`
+    // target knows what it put there, while this only knows it is loading
+    // whatever is present.
+    cfg.name = match name {
+        Some(name) => name,
+        None if regions.is_empty() => "all".into(),
+        None => {
+            let mut sorted = regions.clone();
+            sorted.sort();
+            sorted.join("+")
+        }
+    };
+    if cfg.name.is_empty() || cfg.name.contains(['.', '/']) {
+        return Err(format!(
+            "--name {:?}: a build name cannot be empty or contain '.' or '/'",
+            cfg.name
+        )
+        .into());
+    }
     // Before anything can be reported, so the log holds the whole run. Note
     // this is not `| tee`: a pipe would make stdout a non-terminal and switch
     // off the live progress line for the one audience it exists for.
@@ -121,37 +146,22 @@ fn run() -> Result<(), Error> {
     match command.as_str() {
         "download" => {
             // `download` with nothing named would otherwise silently do
-            // nothing, which in a Makefile looks exactly like success.
-            download::run(&cfg, &regions, land || regions.is_empty() && !europe, europe)
+            // nothing, which in a Makefile looks exactly like success: a bare
+            // `minimap download` fetches the coastline.
+            let land = land || (regions.is_empty() && !europe);
+            download::run(&cfg, &regions, land, europe)
         }
         "regions" => download::list(&cfg),
         "info" => info::run(&cfg),
         "sql" => sql::run(&cfg, &regions.join(" ")),
-        "load" | "bake" | "export" | "all" => {
+        "load" | "bake" | "export" => {
             cfg.prepare()?;
-            let stages: &[&str] = match command.as_str() {
-                "all" => &["load", "bake", "export"],
-                "load" => &["load"],
-                "bake" => &["bake"],
-                _ => &["export"],
-            };
-            // One connection for the whole run. Opening it per stage is a
-            // second CHECKPOINT and a second spatial-extension load, and at
-            // Europe scale that is minutes.
             let con = cfg.connect(false)?;
-            let t0 = std::time::Instant::now();
-            for stage in stages {
-                match *stage {
-                    "load" => load::run(&cfg, &con, &cfg.regions(&regions)?)?,
-                    "bake" => bake::run(&con)?,
-                    "export" => export::run(&cfg, &con)?,
-                    _ => unreachable!(),
-                }
+            match command.as_str() {
+                "load" => load::run(&cfg, &con, &cfg.regions(&regions)?),
+                "bake" => bake::run(&con),
+                _ => export::run(&cfg, &con),
             }
-            if stages.len() > 1 {
-                println!("\nall done in {}", progress::secs(t0.elapsed()));
-            }
-            Ok(())
         }
         other => Err(format!("unknown command {other:?}\n\n{USAGE}").into()),
     }

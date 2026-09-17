@@ -27,6 +27,8 @@ downloaded extract to a servable archive.
 make            # what this is, how it is configured, where it got to
 make all        # download -> load -> bake -> export
 make serve      # http://127.0.0.1:8090
+make test       # every test, in seconds, needing none of the above
+make check      # cargo fmt --check and clippy with warnings as errors
 ```
 
 The first build takes a few minutes, because `duckdb`'s `bundled` feature
@@ -36,7 +38,8 @@ install and no way for the spatial extension to be a version out of step.
 Everything is a make variable, so nothing needs a source edit:
 
 ```bash
-make all REGIONS="belgium netherlands luxembourg"
+make all REGIONS="belgium netherlands luxembourg"   # a build named belgium+luxembourg+netherlands
+make all REGIONS=france NAME=fr                     # ... or call it what you like
 make all DUCKDB=/mnt/big/duckdb     # put the 154 GB somewhere it fits
 make regions                        # what can go in REGIONS=
 ```
@@ -57,14 +60,24 @@ One directory per kind of thing, so what a directory holds is its name:
 
 Each is a variable, which matters because they differ by three orders of
 magnitude: `make all DUCKDB=/mnt/big/duckdb` puts the 154 GB where there is room
-without moving the 135 MB off the machine that serves it. `make clean` removes
-the computed three and keeps `pbf/`; `make distclean` removes that too, and asks
-first.
+without moving the 135 MB off the machine that serves it. `make disk-stat`
+says what each holds; `make clean-<category>` removes exactly one of `pbf`,
+`duckdb`, `pmtiles`, `log`, `anon` or `binary` (cargo's `target/`) and nothing
+else; `make clean` removes all of them, asking before the downloads.
 
-To work at country granularity, fetch the European extracts once:
+Three maps have targets of their own, each just `make all` with the right
+`REGIONS`:
 
 ```bash
-make europe          # 49 extracts, 31.7 GB, into pbf/
+make picardie        # the default region, a few minutes
+make france          # one country
+make europe          # download the 49 European extracts (31.7 GB), then build them all
+```
+
+To work at country granularity by hand, fetch the European extracts once and
+name the ones you want:
+
+```bash
 make all REGIONS="belgium netherlands luxembourg"
 make all REGIONS=    # ... or every extract present, which is the continent
 ```
@@ -168,20 +181,31 @@ version:
 
 | | |
 | --- | --- |
-| **`pmtiles/<layer>.pmtiles`** | **the deliverable.** One archive per layer. Copy these to the server; nothing else is needed at runtime. |
-| `duckdb/minimap.duckdb` | scaffolding — `features`, `tile_layers`, `meta` |
+| **`pmtiles/<name>.<layer>.pmtiles`** | **the deliverable.** One archive per layer. Copy these to the server; nothing else is needed at runtime. |
+| `duckdb/<name>.duckdb` | scaffolding — `features`, `tile_layers`, `meta` |
 | `duckdb/tmp/` | scaffolding — DuckDB's spill, 80+ GB at Europe scale |
-| `log/<stage>.log` | one per stage |
-| `duckdb/.load`, `duckdb/.bake`, `pmtiles/.export` | which stages are done |
+| `log/<name>.<stage>.log` | one per stage |
+| `duckdb/.load-<name>-…`, `.bake-…`, `pmtiles/.export-…` | which stages are done |
 | `pbf/<region>.osm.pbf` | input — expensive, never auto-deleted |
 | `pbf/land-polygons-split-3857.zip` | input — the coastline, which OSM has no ocean for |
+
+`<name>` is the build's `NAME`, derived from `REGIONS` unless given: `picardie`,
+`belgium+netherlands`, or `europe` when `REGIONS` is empty. Every file a build
+writes carries it, so a Picardie test build sits beside the continent in the
+same three directories and can never overwrite it:
+
+```bash
+make all                        # picardie.*.pmtiles, in a few minutes
+make all REGIONS=               # europe.*.pmtiles, beside it
+make serve NAME=picardie        # pick one; `make info` lists what is there
+```
 
 Each stamp lives **with the thing it describes** — load and bake write the
 database, export writes the archives. So `rm -rf duckdb/` correctly makes `load`
 pending again, and there is no way to hold a stamp claiming something exists when
 it does not.
 
-**To rebuild: just `make all`.** You should not normally need `make clean` first,
+**To rebuild: just `make all`.** You should not normally need to clean anything first,
 and this is the part worth understanding, because a full rebuild of Europe is
 hours and most changes do not need one.
 
@@ -203,23 +227,25 @@ make all REGIONS="picardie nord-pas-de-calais"   # load, bake, export
 make all REGIONS=                           # every extract in pbf/
 ```
 
-So `make clean` is for two things only:
+So cleaning is for two things only:
 
 * **reclaiming disk** — the database dwarfs the archives (1.1 GB against 135 MB
   on Picardie; 154 GB against 15 GB on Europe), and once you have exported you
-  do not need it until the next build. `rm -rf duckdb/` alone is enough, and
-  leaves the deliverable in place;
+  do not need it until the next build. `make clean-duckdb` alone is enough, and
+  leaves the deliverable in place; `make prune` is that plus the logs;
 * **starting genuinely from scratch** — a suspected-corrupt database, or an
   interrupted build you would rather not resume.
 
 ```bash
-make clean && make all      # from scratch, keeping the 31 GB of extracts
-make distclean              # ... and drop the extracts too (asks first)
+make disk-stat                      # what is on the disk, by category, and what recovers each
+make clean-duckdb clean-pmtiles     # from scratch, keeping the 31 GB of extracts
+make all
+make clean                          # everything, downloads and compiler output too (asks first)
 ```
 
-`clean` never touches `pbf/`, which is the whole reason it is its own directory.
-Re-downloading 31 GB from a free service to re-run a bake would be both slow and
-rude.
+Each `clean-<category>` touches its one directory and nothing else. `pbf/` is
+the one that asks: re-downloading 31 GB from a free service to re-run a bake
+would be both slow and rude.
 
 ### Watching a build
 
@@ -237,7 +263,12 @@ per-zoom table scan for a bake, extract size for a load — so the estimate is
 real arithmetic rather than a spinner, and wrong early while it calibrates. It
 says `~` for a reason.
 
-Each stage also writes `build/log/<stage>.log`, via `--log` rather than a pipe.
+The same bar covers everything that runs long enough to wonder about: every
+pipeline stage, `make anon`, `make working-set`, and the downloads. The one
+thing outside it is the first compile, where cargo's own bar shows DuckDB
+building; after that the binaries are rebuilt quietly and run directly.
+
+Each stage also writes `log/<name>.<stage>.log`, via `--log` rather than a pipe.
 That distinction matters: `| tee` makes the tool's stdout a pipe, and a pipe is
 exactly how it decides there is no terminal to draw a bar on — so teeing would
 silently trade the thing you are watching for the file you are not. Writing the
@@ -250,13 +281,18 @@ the Saint-Leu quarter of Amiens:
 
     http://127.0.0.1:8090/#16/49.89870/2.30160
 
-The backend exposes three routes, and `web/` needs nothing else:
+The backend exposes five routes, and the viewer needs nothing else:
 
 | route | returns |
 | --- | --- |
-| `GET /` | the viewer |
-| `GET /meta.json` | TileJSON: zoom range, bounds, centre |
-| `GET /tiles/{layer}/{z}/{x}/{y}` | one layer's MVT tile; `204` if empty, `404` if no such layer |
+| `GET /` | the viewer shell, with `<base href>` set to wherever it was reached |
+| `GET /minimap.js` | the viewer, compiled into the binary |
+| `GET /meta.json` | TileJSON: zoom range, bounds, centre, and each layer's rungs |
+| `GET /tiles/{layer}/{z}/{x}/{y}` | one layer's MVT tile, still gzipped; `204` if empty, `404` if no such layer, `304` on a matching etag |
+| `GET`/`POST /zone` | the anonymity zone for a `lat`/`lon` (see `anon/README.md`); `404` until `make anon` has run |
+
+`server/tests/routes.rs` asserts every one of those status codes, because the
+viewer treats them as facts rather than as errors.
 
 ## How it works
 
@@ -302,7 +338,10 @@ while `buildings` start at z15 needs no special case, and re-baking one layer
 invalidates only that one. The price is a request per layer per tile.
 
 **The backend** opens one mmap per layer and answers with a Hilbert id and two
-binary searches. That is the whole runtime.
+binary searches. That is the whole runtime. Leaf directories are decoded on
+first touch and kept in a per-archive cache of at most 128 MB -- bounded,
+because Europe's `roads` alone has 85M directory entries and holding them all
+decoded would be 1.9 GB of heap.
 
 Each tile carries exactly one attribute per feature, `cls`, because that is all
 the styling needs. Street names stay in the `features` table — the viewer draws
@@ -311,12 +350,13 @@ no labels, and carrying names would inflate every tile by roughly 40%.
 **The frontend** (`web/minimap.js`) has no dependencies. It contains a ~50-line
 protobuf reader, an ~80-line MVT decoder, and a canvas renderer. Because tile
 coordinates arrive as integers on a 0..4096 grid, drawing is a single affine map
-to screen pixels.
+to screen pixels. The decoder is tested under node against tiles encoded by hand
+(`web/minimap.test.js`); the renderer is checked by looking at it.
 
 ## Layout
 
 ```
-Makefile           the interface: stages, their order, and what `clean` means
+Makefile           the interface: stages, their order, and what each `clean-*` removes
 README.md          this
 minimap_rs/        the build tool: download / load / bake / export / info / sql
   src/tuning.rs      what the map IS: layers, classes, thresholds, the SQL
@@ -332,14 +372,18 @@ minimap_rs/        the build tool: download / load / bake / export / info / sql
   attic/             programs that were needed once; see its README
 server/            serves the archives: axum + mmapped PMTiles, no database
   README.md          embedding the map and/or the zones in your own axum app
-  web/index.html     page shell
-  web/minimap.js     protobuf reader + MVT decoder + canvas renderer
+  src/pmtiles.rs     the archive reader, and its bounded leaf cache
+  web/index.html     page shell, compiled into the binary
+  web/minimap.js     protobuf reader + MVT decoder + canvas renderer, likewise
+  web/minimap.test.js  the decoder, under node
+  tests/routes.rs    every status code the viewer relies on
+  tests/cache_perf.rs  `make perf`: what the server's caches cost
 anon/              a separate service on the same `features` table
 
-pbf/               downloaded. `clean` never touches this.
+pbf/               downloaded. Only `clean-pbf` removes it, and it asks.
   *.osm.pbf          the extracts
   land-polygons-*    the coastline, which OSM does not have
-duckdb/            the database, and DuckDB's spill. `clean` removes it.
+duckdb/            the database, and DuckDB's spill. `clean-duckdb` removes it.
 pmtiles/           one archive per layer -- the deliverable
 log/               one file per stage, because these run for hours
 ```
@@ -355,12 +399,14 @@ build directory a flag rather than a rebuild.
 **The rungs are z10, z12, z15, z17** (`ZOOMS` in `tuning.rs`). Past the deepest
 the viewer overzooms once, reusing z17 scaled 2× to reach the 192 m view.
 
-**`MAXZOOM` is the main cost dial**, because the size filter is derived from it.
-At z12 a tile spans ~6.3 km at latitude 50°, so a 10 m building is ~0.8 px and
-the filter discards essentially all of the ~1.8M buildings in the extract —
-correct, but it means no buildings. z14 brings the threshold down to ~18 m, so
-buildings appear and a city quarter is legible; it also multiplies the tile count
-by ~16 and is what makes the database interesting in size rather than trivial.
+**The deepest rung is the main cost dial**, because the size filter is derived
+from it. At z12 a tile spans ~6.3 km at latitude 50°, so a 10 m building is
+~0.8 px and the filter discards essentially all of the ~1.8M buildings in the
+extract — correct, but it means no buildings. z14 brings the threshold down to
+~18 m, so buildings appear and a city quarter is legible; it also multiplies
+the tile count by ~16 and is what makes the database interesting in size rather
+than trivial. (These numbers were measured when the deepest rung was z14; the
+rungs are now z10/12/15/17 and the arithmetic scales the same way.)
 
 Because the filter runs during extraction, a database loaded for one deepest rung
 does not contain what a deeper one would need — it would produce an archive that
@@ -442,8 +488,8 @@ DuckDB does not return after the `raw` staging table is dropped. At Europe scale
 that dead space would be hundreds of GB, so the staging table should go —
 classification could run per batch straight into `features`. Not done yet.
 
-Only `tiles` and `meta` are read at serve time, so the build database never needs
-to reach the server.
+Nothing in the database is read at serve time -- the archives are the whole of
+what the server opens -- so the build database never needs to reach it.
 
 **Bulk loading must not go through `INSERT`.** An earlier version inserted the
 staged rows one statement at a time and spent over 40 minutes without finishing a
@@ -543,22 +589,23 @@ storage. Two consequences:
    sorted run) so a lookup costs 1–2 page faults. This is precisely what PMTiles
    does, which is a good reason to use it rather than reinvent it.
 
-**Sizing.** Cumulative tile bytes by `MAXZOOM`, measured for Picardie and scaled
-to Europe by the 262× PBF-size ratio:
+**Sizing.** Cumulative tile bytes by deepest rung, measured for Picardie at an
+earlier rung set and scaled to Europe by the 262× PBF-size ratio:
 
-| MAXZOOM | Picardie | Europe tiles | Europe raw | Europe gzipped |
+| deepest rung | Picardie | Europe tiles | Europe raw | Europe gzipped |
 | --- | --- | --- | --- | --- |
 | 12 | 23.7 MB | ~245k | 6.2 GB | **4.2 GB** |
 | 13 | 41.2 MB | ~889k | 10.8 GB | **7.2 GB** |
 | 14 | 78.5 MB | ~3.4M | 20.6 GB | **13.8 GB** |
 
-(Upper bounds: a real lower-`MAXZOOM` build also coarsens the size filter and
-keeps fewer features, so it lands smaller than truncating a z14 build.)
+(Upper bounds: a build with a shallower deepest rung also coarsens the size
+filter and keeps fewer features, so it lands smaller than truncating a z14
+build.)
 
 Europe at z14 is ~14 GB gzipped, which does not comfortably share a 20–25 GB VPS
 disk with an OS. Three ways out, in increasing order of how much they solve:
 
-- **Cap `MAXZOOM` at 12** — 4.2 GB gzipped, fits anywhere, but no buildings.
+- **Stop the rungs at z12** — 4.2 GB gzipped, fits anywhere, but no buildings.
 - **Serve a region, not the continent** — the pipeline is per-country already.
 - **Put the archive in object storage and skip the VPS.** Convert to
   [PMTiles](https://protomaps.com/docs/pmtiles) and host it on R2/B2/S3 behind a
@@ -593,6 +640,14 @@ Concentration is doing all the work. Traffic spread evenly over Europe at z17
 would want all 27 GB resident, every request would miss, and the same box would
 serve two orders of magnitude fewer people. A map that everyone looks at in the
 same twenty cities is the easy case, and it is also the usual one.
+
+The process itself stays small whatever the traffic does: its one heap
+structure of any size is the decoded-directory cache in `server/src/pmtiles.rs`,
+capped at 128 MB per archive, so six layers can never hold more than 768 MB
+however far a client walks, and only the three deep layers can approach it.
+That cap exists because the alternative was measured -- every directory entry
+of Europe's six archives, decoded, is 3.1 GB -- and `make perf TILES=pmtiles`
+checks it holds against the archives that shipped.
 
 **What one viewer costs** — measured, except where noted:
 
@@ -638,27 +693,16 @@ And the cheapest fix for all three, if the traffic ever justifies it: a CDN in
 front. Tiles are immutable within a build and already carry the etag and the
 week-long `max-age` that make caching them correct.
 
-### Scaling to Europe
+### Scaling past Europe
 
-The pipeline is region-agnostic (`make all REGIONS=europe`). Extraction *time* is no
-longer the obstacle — the Rust extractor parallelises over blobs, so a 262×
-larger file mostly means 262× more work spread over the same cores. What is left
-is memory, and it is the reason a whole-Europe run is still not a thing you can
-just start:
-
-1. **Node cache.** The extractor holds one 16-byte record per node that some way
-   it keeps refers to — 13.8M of Picardie's 15.2M nodes, or 220 MB. Europe is
-   ~262× the PBF, so that is tens of GB and still does not fit. The structure is
-   already the right one to fix it, though: it is a sorted array built in one
-   pass and then only read, so it can be written to a file and mmapped without
-   changing anything above it. That is the `dense_file_array` idea, minus the
-   need to size it for every node in the planet.
-2. **Way references.** Pass 2 holds the node ids of every way it keeps, which is
-   the other unbounded structure and the larger one for dense extracts. Same
-   remedy, and it has to happen at the same time.
-3. **Tile count.** z14 over Europe is millions of tiles rather than thousands.
-   At that point pre-baking every tile stops being the obvious choice, and either
-   a lower `MAXZOOM` or on-demand baking (DuckDB can build a tile per request —
-   the same `ST_AsMVT` call, just not stored) becomes the better trade.
+Europe is built -- "The whole continent" above has the numbers -- and the two
+structures that were expected to stop it did not: the extractor's node array
+and way references are sized per region, and a region at a time is what the
+load does. What still scales badly is the tile count at the deepest rung, and
+the lever for that is in `tuning.rs`, not in the code: each rung is ~4x the
+one above it, so dropping z17 divides the build by about four. Baking on
+demand (DuckDB can produce a tile per request with the same `ST_AsMVT` call,
+just not stored) is the other trade, and the one this design deliberately does
+not make, because it would put the database on the serving machine.
 
 Map data © OpenStreetMap contributors, ODbL.

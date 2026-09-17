@@ -17,9 +17,11 @@ never needs DuckDB, the extracts, or anything else the pipeline wanted:
 
 | | size (Europe) | produced by |
 |---|---:|---|
-| `pmtiles/<layer>.pmtiles` | 29 GB | `make all` |
-| `anon/anon-zones.bin` | 70 MB | `make anon` |
-| `server/web/` — `index.html`, `minimap.js` | 40 kB | in the repo |
+| `pmtiles/<name>.<layer>.pmtiles` | 29 GB | `make all` |
+| `anon/<name>.anon-zones.bin` | 70 MB | `make anon` |
+
+`<name>` is the build (`europe`, `picardie`); several share the directory, and
+the server is told which one to open.
 
 Code — and both halves are libraries, so nothing here is copied:
 
@@ -27,11 +29,21 @@ Code — and both halves are libraries, so nothing here is copied:
 * **this crate** — `src/lib.rs` is the server (paths in, an axum `Router` out);
   `src/main.rs` is that library plus an environment and a listen address.
   `src/pmtiles.rs` is public too, for a host that wants the archive reader and
-  none of the HTTP.
+  none of the HTTP. The viewer (`web/index.html`, `web/minimap.js`) is
+  compiled into the library with `include_str!`, so there is no directory of
+  static files to ship or to point anything at.
 
 Everything below assumes the artifacts sit somewhere on the host's disk and
 get there by `scp` or the deploy pipeline — copying `pmtiles/` *is* the
-deployment, as the top-level README's serving notes explain.
+deployment, as the top-level README's serving notes explain. Standalone, that
+is the whole of it:
+
+```bash
+make build                                   # target/release/minimap-backend
+MINIMAP_TILES=/srv/pmtiles MINIMAP_NAME=europe ANON_INDEX=/srv/europe.anon-zones.bin minimap-backend
+```
+
+`MINIMAP_NAME` can be left out when the directory holds a single build.
 
 ## Zones alone
 
@@ -49,7 +61,7 @@ answering nonsense.
 ```rust
 struct Anon { map: memmap2::Mmap, index: anon_format::Index, tier: usize }
 
-let file = std::fs::File::open("anon-zones.bin")?;
+let file = std::fs::File::open("europe.anon-zones.bin")?;
 // SAFETY: the file is immutable for the life of the process. A re-bake
 // writes a new file and the service restarts onto it.
 let map = unsafe { memmap2::Mmap::map(&file)? };
@@ -73,17 +85,19 @@ minimap-server = { path = "…/minimap/server" }   # or a pinned git rev
 ```rust
 let opts = minimap_server::Options {
     tiles: "/srv/pmtiles".into(),
-    web: "…/minimap/server/web".into(),
-    zones: Some("/srv/anon-zones.bin".into()),
+    name: "europe".into(),            // which <name>.<layer>.pmtiles set
+    zones: Some("/srv/europe.anon-zones.bin".into()),
     k: Some(64),
 };
 app = app.nest("/map", minimap_server::MapServer::open(&opts)?.router());
 ```
 
 `.router()` applies its own state, so nothing about the host's extractors or
-state type changes. The viewer's requests are all relative and the shell
-redirects to a trailing slash first, so `/map/` works without the viewer
-knowing it is nested.
+state type changes. The viewer's requests are all relative, and the shell is
+served with a `<base href>` naming the prefix it was reached under, so `/map`
+works without the viewer knowing it is nested. Link to `/map`, not `/map/`:
+axum's `nest` routes the bare prefix and everything below it, but not the
+prefix with a trailing slash — `server/tests/routes.rs` pins this down.
 
 **`open` fails when there are no archives**, deliberately: a map server with no
 map is a misconfiguration. A host that wants to boot anyway — a test suite, a
@@ -195,8 +209,20 @@ synthetic 42 MB archive:
 | what a 304 saves over it | the body, plus ~0.2 µs |
 | RSS per request, steady state | 0 |
 
-Two of those numbers matter to an embedding:
+Three of those numbers matter to an embedding:
 
+* **The leaf cache is bounded, and the bound is per archive.** A PMTiles
+  directory entry decodes to 24 bytes, and Europe's `roads.pmtiles` has 85M of
+  them: held whole, the leaf directories of six layers would be 3.1 GB of heap,
+  more than the page-cache working set the box is sized for. So each archive
+  keeps at most `pmtiles::LEAF_CACHE_BYTES` (128 MB, ~180 of `roads`' 29k-entry
+  leaves) of decoded leaves and drops the least recently used past that. A leaf
+  at z17 spans ~50 km, so a city is a leaf or two per rung and real traffic
+  never evicts; a crawler walking the continent pays ~0.6 ms per tile to
+  re-decode a leaf and cannot grow the process. `make perf` sweeps a fixture
+  with room for eight leaves and checks the bound holds; `make perf
+  TILES=pmtiles` does the same against the archives that shipped and prints
+  the arithmetic.
 * **A hot tile does not scale across cores.** Every leaf hit takes the one
   `Mutex` in `Archive`, so 16 threads on the same tile get ~4.3 M lookups/s
   between them where one thread gets 19.6 M. It is 200 ns of lock, not a

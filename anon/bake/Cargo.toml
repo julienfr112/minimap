@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 anon-format = { path = "../format" }
+progress = { path = "../../progress", package = "minimap-progress" }
 # The building footprints come from the tile pipeline's `features` table, so the
 # bake needs the same DuckDB the pipeline was built with. Nothing in the service
 # does.

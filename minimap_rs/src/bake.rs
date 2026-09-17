@@ -5,8 +5,8 @@ use std::time::Instant;
 use duckdb::Connection;
 
 use crate::load;
-use crate::progress::{self, Step};
 use crate::tuning::{self, BUFFER, EXTENT, LAYERS, MPP0, WORLD};
+use progress::Step;
 
 type Error = Box<dyn std::error::Error>;
 
@@ -184,11 +184,10 @@ pub fn run(con: &Connection) -> Result<(), Error> {
     // The data's own horizontal extent, so the band loops can skip the parts of
     // the world nothing was loaded for. One query, and at a deep rung it is the
     // difference between 34 statements and 4,096.
-    let (data_min_x, data_max_x): (f64, f64) = con.query_row(
-        "SELECT min(min_x), max(max_x) FROM features",
-        [],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
+    let (data_min_x, data_max_x): (f64, f64) =
+        con.query_row("SELECT min(min_x), max(max_x) FROM features", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
 
     let step = Step::start(
         "bake",
@@ -241,10 +240,7 @@ pub fn run(con: &Connection) -> Result<(), Error> {
 
     // Weighted by rung, so the bar reflects work rather than levels done.
     let rungs: Vec<u8> = tuning::ZOOMS.into_iter().filter(|z| *z >= start).collect();
-    let tiling: f64 = rungs
-        .iter()
-        .map(|z| zoom_weight(*z))
-        .sum();
+    let tiling: f64 = rungs.iter().map(|z| zoom_weight(*z)).sum();
     progress::begin(tiling);
 
     for z in rungs {
@@ -254,9 +250,12 @@ pub fn run(con: &Connection) -> Result<(), Error> {
         // only pays for what overlaps it.
         let all = live_bands(z, BAKE_BUDGET, data_min_x, data_max_x);
         let slices = all.len().max(1);
-        let baked: Vec<&str> = LAYERS.iter().copied().filter(|l| tuning::bakes(l, z)).collect();
-        let unit =
-            zoom_weight(z) / (baked.len().max(1) * slices) as f64;
+        let baked: Vec<&str> = LAYERS
+            .iter()
+            .copied()
+            .filter(|l| tuning::bakes(l, z))
+            .collect();
+        let unit = zoom_weight(z) / (baked.len().max(1) * slices) as f64;
 
         for layer in baked {
             for (n, &(_, lo, hi)) in all.iter().enumerate() {
@@ -282,10 +281,7 @@ pub fn run(con: &Connection) -> Result<(), Error> {
             [z],
             |r| r.get(0),
         )?;
-        progress::timed(
-            format!("z{z}  {} tiles", progress::commas(made as u64)),
-            t0,
-        );
+        progress::timed(format!("z{z}  {} tiles", progress::commas(made as u64)), t0);
     }
 
     // `tile_layers` is the deliverable now, not scaffolding: export writes one
@@ -302,6 +298,7 @@ pub fn run(con: &Connection) -> Result<(), Error> {
          CREATE INDEX IF NOT EXISTS tile_layers_lzxy ON tile_layers (layer, z, x, y);
          CHECKPOINT",
     )?;
+    progress::at("computing the map's bounds");
     bounds(con)?;
     progress::end();
 
@@ -332,7 +329,7 @@ pub fn run(con: &Connection) -> Result<(), Error> {
 /// Bounds for the viewer, back in WGS84. ST_Extent returns a BOX_2D whose
 /// fields are not struct-accessible, so read the corners off the geometry.
 fn bounds(con: &Connection) -> Result<(), Error> {
-    con.execute_batch(&format!(
+    con.execute_batch(
         r#"
         DROP TABLE IF EXISTS meta;
         CREATE TABLE meta AS
@@ -344,7 +341,102 @@ fn bounds(con: &Connection) -> Result<(), Error> {
         SELECT ST_XMin(g) AS west, ST_YMin(g) AS south,
                ST_XMax(g) AS east, ST_YMax(g) AS north
         FROM b
-        "#
-    ))?;
+        "#,
+    )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Bands tile the zoom's columns exactly: contiguous, in order, covering
+    /// every column once, and a zoom within budget is one band.
+    #[test]
+    fn bands_partition_the_columns() {
+        for z in 0..=17u8 {
+            let b = bands(z, BAKE_BUDGET);
+            let cols = 1u64 << z;
+            assert_eq!(b[0].0, 0);
+            assert_eq!(b[b.len() - 1].1, cols, "z{z}");
+            for w in b.windows(2) {
+                assert_eq!(w[0].1, w[1].0, "z{z}: bands must abut");
+            }
+            if z <= BAKE_BUDGET {
+                assert_eq!(b.len(), 1, "z{z} fits one statement");
+            } else {
+                assert_eq!(b.len(), 1 << (2 * (z - BAKE_BUDGET) as u32), "z{z}");
+            }
+        }
+    }
+
+    /// Only the bands whose columns overlap the data survive, and they keep
+    /// their index among all bands so a resumed bake can name the same one.
+    #[test]
+    fn live_bands_keep_only_what_the_data_touches() {
+        let z = 14u8; // 64 bands of 256 columns
+        let span = tuning::tile_span(z);
+        // Data covering columns 300..=700: bands 1 (256..512) and 2 (512..768).
+        let min_x = -WORLD + 300.5 * span;
+        let max_x = -WORLD + 700.5 * span;
+        let live = live_bands(z, BAKE_BUDGET, min_x, max_x);
+        assert_eq!(live, vec![(1, 256, 512), (2, 512, 768)]);
+        // The whole world is every band.
+        assert_eq!(live_bands(z, BAKE_BUDGET, -WORLD, WORLD).len(), 64);
+        // A sliver still lands in exactly one band.
+        let one = live_bands(z, BAKE_BUDGET, -WORLD + span, -WORLD + 1.5 * span);
+        assert_eq!(one, vec![(0, 0, 256)]);
+    }
+
+    /// Each rung costs about four times the one above plus a fixed scan, so
+    /// the weights are increasing and the deepest rung dominates.
+    #[test]
+    fn zoom_weights_grow_by_four_and_carry_a_scan_floor() {
+        let zs = tuning::ZOOMS;
+        for w in zs.windows(2) {
+            assert!(zoom_weight(w[1]) > zoom_weight(w[0]));
+        }
+        let deepest = zoom_weight(tuning::maxzoom());
+        let total: f64 = zs.iter().map(|z| zoom_weight(*z)).sum();
+        assert!(
+            deepest / total > 0.5,
+            "the deepest rung is most of the bake"
+        );
+        // The scan share keeps the shallowest rung from rounding to nothing.
+        assert!(
+            zoom_weight(tuning::minzoom())
+                >= SCAN_SHARE * 4f64.powi(i32::from(tuning::maxzoom() - tuning::minzoom()))
+        );
+    }
+
+    /// The SQL for a band is bounded to its own columns on both sides, so a
+    /// feature straddling two bands is emitted once per band and never twice
+    /// for the same tile.
+    #[test]
+    fn band_sql_clamps_to_its_columns_and_names_its_layer() {
+        let sql = band_sql(12, "roads", 1024, 1536, "tile_layers");
+        assert!(sql.contains("INSERT INTO tile_layers"));
+        assert!(sql.contains("WHERE layer = 'roads' AND minzoom <= 12"));
+        assert!(sql.contains(", 1024) AS x0"), "lower clamp: {sql}");
+        assert!(
+            sql.contains(", 1535) AS x1"),
+            "upper clamp is inclusive: {sql}"
+        );
+        assert!(
+            sql.contains("ST_Simplify(geom,"),
+            "lines use the plain simplifier"
+        );
+        assert!(!sql.contains("ST_MakeValid"), "lines cannot go invalid");
+        assert!(
+            !sql.contains("name: name"),
+            "only the label layer carries names"
+        );
+
+        let areas = band_sql(12, "buildings", 0, 4096, "t");
+        assert!(areas.contains("ST_SimplifyPreserveTopology"));
+        assert!(areas.contains("ST_MakeValid"));
+
+        let labels = band_sql(10, tuning::NAMED_LAYER, 0, 1024, "t");
+        assert!(labels.contains("name: name"));
+    }
 }
