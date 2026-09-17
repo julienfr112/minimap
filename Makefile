@@ -75,9 +75,23 @@ ANON    ?= anon/$(NAME).anon-zones.bin
 # vagueness (~200 m in Paris, ~1 km in open country); the index also carries 16
 # and 256, so changing this is a restart, not a re-bake.
 ANON_K  ?= 64
-# Extra anon-bake flags: --min-footprint 25 drops the sheds and barns that
-# inflate a hamlet's building count, --k 16,64,256 picks the tiers.
-ANON_FLAGS ?=
+# Extra anon-bake flags. `--min-footprint 25` is on by default because the
+# guarantee is "k buildings" and a barn is not a household: over Picardie it
+# drops 347,832 of 1,826,626 footprints (19%) as sheds and outbuildings, and
+# every zone it changes gets *larger* -- k=64 open country goes from a 675 m
+# median radius to 886 m, k=16 from 140 m to 177 m. Dropping buildings can
+# only ever widen a zone, never narrow one, so this direction cannot weaken
+# the guarantee; leaving it off is what made the sparse ones flattering.
+#
+# 25 m2 is the knee: city-centre medians are identical at 0, 10, 15 and 25
+# (110 m at k=64) and only move at 40, which is where real small houses start
+# being discarded. So it costs nothing where people are dense and fixes the
+# hamlet of three houses and thirty barns.
+#
+# `make anon ANON_FLAGS=` bakes the old way; `--k 16,64,256` picks the tiers.
+# Note make cannot see this variable change: the index is a plain file with no
+# stamp, so re-bake with `make clean-anon anon` after editing it.
+ANON_FLAGS ?= --min-footprint 25
 
 # --- derived ---------------------------------------------------------------
 

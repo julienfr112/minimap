@@ -14,6 +14,11 @@ DuckDB `features`  --anon-bake-->  <name>.anon-zones.bin  --anon-serve-->  HTTP
                     70.3 MB, all of Europe
 ```
 
+(Those Europe figures are from a bake before `--min-footprint 25` became the
+default. Re-baking the continent now keeps roughly four footprints in five, so
+expect fewer buildings, fewer zones and a smaller file, with every zone the
+same size or wider.)
+
 The lookup is one function over one file — [`Index::zone`] — and the file is the
 compressed form, not an archive that gets inflated first. Nothing else is
 consulted: no database, no geometry library, no decompression pass.
@@ -26,8 +31,12 @@ make anon-serve     # the standalone service, http://127.0.0.1:8091
 curl -d 'lat=49.8949&lon=2.3020' localhost:8091/zone
 ```
 
-Flags go through `ANON_FLAGS` (`make anon ANON_FLAGS='--min-footprint 25'`);
-`anon-bake --help` lists them. The map server picks the index up too: after
+Flags go through `ANON_FLAGS`; `anon-bake --help` lists them. The default is
+`--min-footprint 25`, which drops the sheds and barns a rural building count
+would otherwise pad itself with — see **Buildings are a proxy for people**
+below for what it measures, and `make anon ANON_FLAGS=` to bake without it.
+
+The map server picks the index up too: after
 `make anon`, `make serve` grows a `/zone` endpoint and the viewer lets you
 **click a point to see its zone** — the exact cells, filled; not the bbox,
 which is a bound and reads twice as big — because the honest way to explain
@@ -221,10 +230,25 @@ means anyone who asks twice keeps the smaller answer. One `k` per deployment
 
 * **Buildings are a proxy for people.** A hamlet of three houses and thirty barns
   counts as thirty-three, so a `k=32` zone there could be one family. This is the
-  weakness that matters, and it is one flag: `--min-footprint 25` drops sheds.
+  weakness that matters, and it is one flag — `--min-footprint 25`, on by
+  default since 2026-09-17. Over Picardie it discards 347,832 of 1,826,626
+  footprints (19%) and every zone it moves gets **larger**: at `k=64` the open
+  country median radius goes 675 m → 886 m, village 224 m → 278 m, while
+  city-centre does not move at all (110 m). Dropping buildings can only widen a
+  zone, never narrow one, so the flag cannot weaken the guarantee — leaving it
+  off is what made the sparse zones flattering.
+
+  25 m² is the knee rather than a round number: city-centre medians are
+  identical at 0, 10, 15 and 25, and only move at 40 (110 m → 123 m), which is
+  where real small houses start being dropped. So it is free where people are
+  dense and it is the whole fix where they are not.
+
   Baking against address points or a population grid instead is better still and
   changes nothing downstream — the count per cell is all the bake wants from the
-  data. A 200-flat tower counting once errs the safe way.
+  data. A 200-flat tower counting once errs the safe way, and weighting a
+  footprint by the dwellings it probably holds is the lever not pulled here: it
+  would shrink dense-city zones several-fold, but it changes the promise from
+  "k buildings" to "k homes", which is an operator's call and not a default.
 * **A trajectory is not a position.** Zones are stable, so a sequence of them is
   a path at zone resolution, and a home zone plus a work zone identifies very
   few people. Anonymising each point of a trace is not anonymising the trace.
