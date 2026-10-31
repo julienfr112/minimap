@@ -17,7 +17,7 @@ never needs DuckDB, the extracts, or anything else the pipeline wanted:
 
 | | size (Europe) | produced by |
 |---|---:|---|
-| `pmtiles/<name>.<layer>.pmtiles` | 29 GB | `make all` |
+| `pmtiles/<name>.<layer>.pmtiles` | 11 GB | `make all` |
 | `anon/<name>.anon-zones.bin` | 70 MB | `make anon` |
 
 `<name>` is the build (`europe`, `picardie`); several share the directory, and
@@ -123,7 +123,7 @@ prefix with a trailing slash — `server/tests/routes.rs` pins this down.
 
 **`open` fails when there are no archives**, deliberately: a map server with no
 map is a misconfiguration. A host that wants to boot anyway — a test suite, a
-dev machine without the 29 GB — should treat the error as "no map today" and
+dev machine without the 11 GB — should treat the error as "no map today" and
 skip the `nest`, not paper over it inside the library.
 
 ## The viewer as a component
@@ -228,7 +228,7 @@ breaks by accident, each the subject of a longer note in `anon/README.md`:
 ## Operating cost
 
 Everything is mmapped, so the host machine needs the disk and little else:
-the kernel keeps hot pages resident and a Europe-sized 29 GB map serves fine
+the kernel keeps hot pages resident and a Europe-sized 11 GB map serves fine
 from a 1 GB VPS. See "Deploying on a small VPS" in the top-level README for
 the measured numbers.
 

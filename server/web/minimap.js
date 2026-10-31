@@ -165,11 +165,11 @@ const FALLBACK_LEVELS = [10, 12, 14];
 // style and is skipped.
 const LAYER_ORDER = ['land', 'landuse', 'water', 'roads', 'buildings', 'places'];
 
-// How far past the deepest rung the viewer will go. One doubling: the geometry
-// there was simplified to one pixel at the rung's own zoom, so a 2x stretch
-// costs about two pixels of error and is what turns a z17 rung into the 192 m
-// view. Two doublings would be 4x, which is the point where it reads as blurry.
-const OVERZOOM = 1;
+// How far past the deepest rung the viewer will go. The deepest rung is cut at
+// z15 but drawn for z16 (`tuning.rs`: DETAIL), so three doublings reach the
+// 192 m view with the geometry stretched 4x: corners move by about a pixel and
+// every street is still there. Keep it at DETAIL + 2 - the deepest rung.
+const OVERZOOM = 3;
 
 // One mouse-wheel click, in the units `deltaY` reports. A trackpad sends a
 // stream of small deltas instead, so they are accumulated and spent a stop at a

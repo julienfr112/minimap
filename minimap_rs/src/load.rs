@@ -80,8 +80,13 @@ pub fn run(cfg: &Config, con: &Connection, regions: &[Region]) -> Result<(), Err
     let tail = 0.15 * bytes + 80e6;
     progress::begin(bytes + tail);
 
+    // The subdivision markers describe the `features` table this replaces:
+    // left behind, they tell `subdivide` the fresh, uncut land and water were
+    // already cut, and the bake then clips whole seas tile by tile.
     con.execute_batch(
         "DROP TABLE IF EXISTS features;
+         DROP TABLE IF EXISTS land_subdivided;
+         DROP TABLE IF EXISTS water_subdivided;
          CREATE TABLE features (
             layer   VARCHAR,
             cls     VARCHAR,
@@ -552,7 +557,9 @@ fn classify_lines(con: &Connection) -> Result<(), Error> {
 /// Areas: water bodies, landuse, buildings. The extractor already stitched
 /// multipolygon relations, so holes and multi-part shapes are intact.
 fn classify_areas(con: &Connection) -> Result<(), Error> {
-    let maxzoom = tuning::maxzoom();
+    // Kept down to the detail the deepest rung is drawn at, not to that rung's
+    // own zoom: a building three pixels wide only at z16 is still drawn by it.
+    let finest = tuning::DETAIL;
     con.execute_batch(&format!(
         r#"
         INSERT INTO features
@@ -583,7 +590,7 @@ fn classify_areas(con: &Connection) -> Result<(), Error> {
             WHERE cls IS NOT NULL AND NOT ST_IsEmpty(geom)
         )
         SELECT *, {cell} AS cell FROM bounded
-        WHERE minzoom <= {maxzoom}
+        WHERE minzoom <= {finest}
         ORDER BY cell
         "#,
         cell = tuning::cell_sql_at_maxzoom(),
@@ -639,7 +646,13 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .unwrap();
-        assert!(n > 100, "monster should shatter into many pieces, got {n}");
+        // At least one piece per whole cell the 50 km square covers.
+        let cell = tuning::tile_span(tuning::maxzoom().saturating_sub(3).max(tuning::minzoom()));
+        let whole = (50_000.0 / cell).floor().powi(2) as i64;
+        assert!(
+            whole > 4 && n > whole,
+            "monster should shatter into many pieces, got {n} for {whole} cells"
+        );
         assert!(
             (area - 2_500_000_000.0 - 10_000.0).abs() < 1.0,
             "area must be conserved, got {area}"

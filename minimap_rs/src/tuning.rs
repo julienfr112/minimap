@@ -18,13 +18,49 @@
 /// tile drawn larger for the levels in between, which holds up to about 4x
 /// before the geometry, simplified to one pixel at *its* zoom, reads as blurry.
 ///
-/// These four cover z10 (49 km across) to z18 (192 m) at integer steps, and put
-/// their only 4x stretch on z14 — between the two views this map is for, rather
-/// than inside either. Each rung is ~4x the tiles of the one above it, so the
-/// deepest is essentially the whole cost of a build.
-pub const ZOOMS: [u8; 4] = [10, 12, 15, 17];
+/// These three cover z10 (49 km across) to z18 (192 m) at integer steps. The
+/// deepest is cut at z15 but drawn at [`DETAIL`], so it serves every view from
+/// 1.5 km down to 192 m on its own; the shallow two put their 4x stretch on z14,
+/// between the two views this map is for rather than inside either.
+pub const ZOOMS: [u8; 3] = [10, 12, 15];
 
-/// The rungs as `10,12,15,17`, for banners and for the archive metadata.
+/// The zoom the deepest rung's geometry is drawn for: simplified to one pixel,
+/// floored at [`MIN_PIXELS`] and gridded at this zoom, then cut into tiles of
+/// the deepest rung, each carrying `2^(DETAIL - maxzoom)` times the grid.
+///
+/// Size goes into tiles rather than into points: the per-tile header and the
+/// features repeated in every tile they cross are most of a deep rung. Measured
+/// on Europe against a z17 rung, the same z16 detail is 85–90% of the bytes in
+/// z17 tiles, 60–73% in z16 tiles, and 47–68% in z15 tiles, which also replace
+/// the z15 rung the old ladder carried beside them. The viewer stretches this
+/// rung to z18, 4x the geometry, which is where a frame of the meeting screen
+/// still showed every street; keep `OVERZOOM` in `web/minimap.js` at
+/// `DETAIL + 2 - maxzoom`.
+pub const DETAIL: u8 = 16;
+
+/// The zoom rung `z`'s geometry is drawn for: [`DETAIL`] for the deepest, its
+/// own zoom for the others.
+pub fn detail(z: u8) -> u8 {
+    if z == maxzoom() {
+        DETAIL
+    } else {
+        z
+    }
+}
+
+/// MVT grid per tile at rung `z`: [`EXTENT`] per tile of the detail zoom, so a
+/// unit is the same ground at every rung drawn for the same zoom.
+pub fn extent(z: u8) -> u32 {
+    EXTENT << (detail(z) - z)
+}
+
+/// The seam overlap at rung `z`, in that rung's units: the same ground as
+/// [`BUFFER`] at the detail zoom.
+pub fn buffer(z: u8) -> u32 {
+    BUFFER << (detail(z) - z)
+}
+
+/// The rungs as `10,12,15`, for banners and for the archive metadata.
 pub fn zooms_csv() -> String {
     ZOOMS
         .iter()
@@ -106,15 +142,15 @@ pub const MIN_PIXELS: f64 = 3.0;
 /// polygons instead of 31,089, and not one building is lost.
 pub const LANDUSE_PIXELS: f64 = 12.0;
 
-/// Smallest projected span worth keeping at `maxzoom`. Anything below this
-/// cannot reach [`MIN_PIXELS`] on screen even at the deepest zoom being baked,
+/// Smallest projected span worth keeping at [`DETAIL`]. Anything below this
+/// cannot reach [`MIN_PIXELS`] on screen even at the finest detail being baked,
 /// so the extractor skips it before paying for WKB. This is what keeps ~1.8M
 /// sub-pixel buildings per region out of the database.
 ///
-/// It is also why a database is specific to the deepest rung it was loaded
-/// for, and why the Makefile's stages depend on this file.
+/// It is also why a database is specific to the detail it was loaded for, and
+/// why the Makefile's stages depend on this file.
 pub fn min_span() -> f64 {
-    MIN_PIXELS * MPP0 / (1u32 << maxzoom()) as f64
+    MIN_PIXELS * MPP0 / (1u32 << DETAIL) as f64
 }
 
 /// Side of one tile at zoom `z`, in projected units.
@@ -355,6 +391,24 @@ mod tests {
         assert_eq!(zooms_csv().split(',').count(), ZOOMS.len());
     }
 
+    /// The deepest rung alone is drawn finer than it is cut, and its grid and
+    /// overlap scale with the difference, so one unit is the same ground as at
+    /// the detail zoom.
+    #[test]
+    fn only_the_deepest_rung_is_drawn_finer_than_it_is_cut() {
+        assert!(DETAIL >= maxzoom());
+        assert_eq!(detail(maxzoom()), DETAIL);
+        for z in ZOOMS {
+            if z != maxzoom() {
+                assert_eq!(detail(z), z);
+                assert_eq!((extent(z), buffer(z)), (EXTENT, BUFFER));
+            }
+            let unit = tile_span(z) / f64::from(extent(z));
+            assert!((unit - tile_span(detail(z)) / f64::from(EXTENT)).abs() < 1e-9);
+            assert_eq!(extent(z) / buffer(z), EXTENT / BUFFER);
+        }
+    }
+
     /// The one rule that decides what a deep rung costs: areal layers stop at
     /// the cap, everything else is baked at every rung.
     #[test]
@@ -371,12 +425,13 @@ mod tests {
     }
 
     /// A feature spanning `min_span` metres is exactly MIN_PIXELS wide at the
-    /// deepest rung; anything smaller can never be drawn, so the extractor
-    /// drops it. Check the arithmetic against the tile geometry it derives from.
+    /// finest detail baked; anything smaller can never be drawn, so the
+    /// extractor drops it. Check the arithmetic against the tile geometry it
+    /// derives from.
     #[test]
-    fn min_span_is_min_pixels_at_the_deepest_rung() {
+    fn min_span_is_min_pixels_at_the_finest_detail() {
         let pixels_per_tile = 512.0;
-        let metres_per_pixel = tile_span(maxzoom()) / pixels_per_tile;
+        let metres_per_pixel = tile_span(DETAIL) / pixels_per_tile;
         assert!((min_span() - MIN_PIXELS * metres_per_pixel).abs() < 1e-9);
         assert!(
             (tile_span(0) - 2.0 * WORLD).abs() < 1e-6,

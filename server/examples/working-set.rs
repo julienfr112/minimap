@@ -4,7 +4,7 @@
 //! process in about a microsecond (`make perf`) -- it is a question of whether
 //! the tiles people actually look at fit in RAM. Traffic is never spread over
 //! the map: it lands on a few dozen city centres, and those centres are a tiny
-//! fraction of a 29 GB archive. This measures that fraction.
+//! fraction of a 11 GB archive. This measures that fraction.
 //!
 //!   make working-set                             the build `make` would serve
 //!   make working-set NAME=picardie               another build in the same directory

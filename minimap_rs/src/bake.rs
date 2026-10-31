@@ -5,7 +5,7 @@ use std::time::Instant;
 use duckdb::Connection;
 
 use crate::load;
-use crate::tuning::{self, BUFFER, EXTENT, LAYERS, MPP0, WORLD};
+use crate::tuning::{self, LAYERS, MPP0, WORLD};
 use progress::Step;
 
 type Error = Box<dyn std::error::Error>;
@@ -91,7 +91,12 @@ fn zoom_weight(z: u8) -> f64 {
 /// `(z, x, y, layer, mvt)` rows.
 fn band_sql(z: u8, layer: &str, lo: u64, hi: u64, into: &str) -> String {
     let tile_span = tuning::tile_span(z);
-    let tolerance = MPP0 / (1u32 << z) as f64; // simplify to roughly one pixel
+    // Drawn for the rung's detail zoom: simplified to roughly one pixel there,
+    // features kept from their own minzoom up to it, and gridded so a unit is
+    // that zoom's. Only the deepest rung differs from its own zoom.
+    let detail = tuning::detail(z);
+    let tolerance = MPP0 / (1u32 << detail) as f64;
+    let (extent, buffer) = (tuning::extent(z), tuning::buffer(z));
     let hi_m1 = hi - 1;
     let band_min_x = -WORLD + lo as f64 * tile_span;
     let band_max_x = -WORLD + hi as f64 * tile_span;
@@ -142,7 +147,7 @@ fn band_sql(z: u8, layer: &str, lo: u64, hi: u64, into: &str) -> String {
                    CAST(FLOOR(({WORLD} - max_y) / {tile_span}) AS INTEGER) AS y0,
                    CAST(FLOOR(({WORLD} - min_y) / {tile_span}) AS INTEGER) AS y1
             FROM features
-            WHERE layer = '{layer}' AND minzoom <= {z}
+            WHERE layer = '{layer}' AND minzoom <= {detail}
               AND max_x >= {band_min_x} AND min_x < {band_max_x}
         ), repaired AS (
             SELECT cls{named}, {repair} AS geom, x0, x1, y0, y1 FROM candidates
@@ -153,14 +158,14 @@ fn band_sql(z: u8, layer: &str, lo: u64, hi: u64, into: &str) -> String {
                  UNNEST(range(y0, y1 + 1)) AS _y(y)
         ), clipped AS (
             SELECT x, y, cls{named},
-                   ST_AsMVTGeom(geom, {bounds}, {EXTENT}, {BUFFER}, true) AS g
+                   ST_AsMVTGeom(geom, {bounds}, {extent}, {buffer}, true) AS g
             FROM exploded
         )
         -- `cls` is all the styling needs, and for every layer but the label one
         -- it is the only attribute a tile carries: names on every feature
         -- inflate a tile by roughly 40% to write text nothing draws.
         SELECT {z}, x, y, '{layer}',
-               ST_AsMVT({{geom: g, cls: cls{name_prop}}}, '{layer}', {EXTENT}, 'geom')
+               ST_AsMVT({{geom: g, cls: cls{name_prop}}}, '{layer}', {extent}, 'geom')
         FROM clipped
         WHERE g IS NOT NULL AND NOT ST_IsEmpty(g)
         GROUP BY x, y
@@ -438,5 +443,28 @@ mod tests {
 
         let labels = band_sql(10, tuning::NAMED_LAYER, 0, 1024, "t");
         assert!(labels.contains("name: name"));
+    }
+
+    /// The deepest rung keeps features down to its detail zoom, simplifies at
+    /// that zoom's pixel, and encodes on the finer grid; a shallow rung does
+    /// all three at its own zoom.
+    #[test]
+    fn the_deepest_rung_is_baked_at_its_detail_zoom() {
+        let z = tuning::maxzoom();
+        let d = tuning::DETAIL;
+        let deep = band_sql(z, "buildings", 0, 1 << 11, "t");
+        assert!(deep.contains(&format!("minzoom <= {d}")), "{deep}");
+        let pixel = MPP0 / f64::from(1u32 << d);
+        assert!(deep.contains(&format!("ST_SimplifyPreserveTopology(geom, {pixel})")));
+        let (extent, buffer) = (tuning::extent(z), tuning::buffer(z));
+        assert!(
+            deep.contains(&format!("{extent}, {buffer}, true)")),
+            "{deep}"
+        );
+        assert!(deep.contains(&format!("'buildings', {extent}, 'geom')")));
+
+        let shallow = band_sql(12, "buildings", 0, 4096, "t");
+        assert!(shallow.contains("minzoom <= 12"));
+        assert!(shallow.contains(&format!("{}, {}, true)", tuning::EXTENT, tuning::BUFFER)));
     }
 }

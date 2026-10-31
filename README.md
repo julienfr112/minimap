@@ -85,20 +85,20 @@ make all REGIONS=    # ... or every extract present, which is the continent
 ### The whole continent
 
 `make all REGIONS=` is the command. What it needs is the part worth reading
-first, because the deepest rung sets the price and z17 is not z14:
+first, because the deepest rung sets the price and z15 is not z12:
 
 | | Picardie | Europe, ~250× by extract bytes |
 | --- | ---: | ---: |
 | `duckdb/` | 1.1 GB | **~260 GB** |
 | DuckDB spill, transient | — | **~100 GB** |
 | `raw` for the largest country, transient | — | **~110 GB** |
-| `pmtiles/` | 135 MB | **~33 GB** |
+| `pmtiles/` | 135 MB | **11.3 GB** |
 | wall clock | 4 m 40 s | **~1.5 days** |
 
 Peak disk is not the sum: the load holds *all features plus one France's `raw`*
 and drops it per region, and the spill belongs to the bake, after `raw` is gone.
-Either way it wants **350–400 GB free**, and the archives are the only 33 GB of
-that you keep.
+Either way it wants **350–400 GB free**, and the archives are the only 11 GB
+of that you keep.
 
 It is resumable. The bake records each finished rung and picks up after the last
 one, so an interrupted run costs the rung in flight rather than the day. Killing
@@ -111,15 +111,18 @@ make all REGIONS= DUCKDB=/mnt/big/duckdb    # the 260 GB elsewhere, archives sta
 make all REGIONS="france belgium netherlands luxembourg germany"   # a subset
 ```
 
-Lowering the deepest rung is the other lever, and by far the biggest: `ZOOMS` in
-`tuning.rs` from `[10, 12, 15, 17]` to `[10, 12, 15]` divides the tile count by
-four and the build by about the same. It costs the 192 m view, which is the whole
-point of the deep rung, so it is a real trade rather than a free saving.
+Lowering `DETAIL` in `tuning.rs` from 16 to 15 is the remaining lever on the
+deep end. It costs the 192 m view, which is the whole point of the deep rung,
+so it is a real trade rather than a free saving.
 
-Downloads are resumable and re-runnable: a complete file is skipped by comparing
-local size to the server's `content-length`, a partial one continues with a
-`Range` request, and a transfer that dies is retried five times from wherever it
-stopped. Four Geofabrik aggregates are deliberately excluded because they
+Downloads are resumable and re-runnable. A transfer writes `<file>.part` and
+takes its real name only once complete, so a file under that name is always a
+finished one, and it is kept as it is even when Geofabrik has published a newer
+extract since (the run warns; delete the file to fetch the current one). A
+`.part` continues with a `Range` request carrying `If-Range` and the version its
+bytes came from, so a resume against a republished extract gets the whole new
+file rather than the new file's tail on the old one's head; a transfer that dies
+is retried five times from wherever it stopped. Four Geofabrik aggregates are deliberately excluded because they
 overlap their own siblings and would be counted twice: `alps`, `dach`,
 `britain-and-ireland`, and `united-kingdom` (which overlaps `great-britain` plus
 Northern Ireland).
@@ -133,7 +136,8 @@ run `cargo run --release --bin minimap -- --help` to see it.
 The archive holds a handful of zoom levels — **rungs** — and the viewer reuses a
 shallower tile drawn larger for everything in between. That works up to about
 4×; past that the geometry, simplified to one pixel at *its* zoom, reads as
-blurry. `ZOOMS` in `tuning.rs` is `[10, 12, 15, 17]`:
+blurry. `ZOOMS` in `tuning.rs` is `[10, 12, 15]`, and the deepest rung is drawn
+for `DETAIL = 16`: simplified, floored and gridded at z16, cut into z15 tiles.
 
 | stop | width at 1000 px | from |
 | --- | --- | --- |
@@ -142,21 +146,29 @@ blurry. `ZOOMS` in `tuning.rs` is `[10, 12, 15, 17]`:
 | z12 | 12.3 km | rung z12, native |
 | z13 | 6.2 km | z12, 2× |
 | z14 | 3.1 km | z12, 4× — the only weak one |
-| z15 | 1.5 km | rung z15, native |
-| z16 | 769 m | z15, 2× |
-| z17 | 385 m | rung z17, native |
-| z18 | 192 m | z17, 2× |
+| z15 | 1.5 km | rung z15, z16 detail drawn at half size |
+| z16 | 769 m | z15, z16 detail native |
+| z17 | 385 m | z15, z16 detail 2× |
+| z18 | 192 m | z15, z16 detail 4× |
 
-Four rungs across nine levels means a 4× stretch lands somewhere; z14 is between
+Why the deepest rung is cut coarser than it is drawn: a deep rung's bytes are
+mostly per tile -- the layer header in every tile, and every road and building
+written again in each tile it crosses -- not per point. Sampled over Europe
+against a z17 rung, the same z16 detail is 85–90% of the bytes in z17 tiles,
+60–73% in z16 tiles, and 47–68% in z15 tiles, which also stand in for a z15 rung
+of their own. A city tile is then ~30 kB of roads and buildings (49 kB the
+heaviest in Paris), drawn as vectors past `RASTER_MAX` in `minimap.js`.
+
+Three rungs across nine levels means a 4× stretch lands somewhere; z14 is between
 the two views this map is for rather than inside either. The viewer's zoom is
 discrete and bounded to exactly these stops.
 
 Each rung is ~4× the tiles of the one above it, so the deepest is essentially the
 whole cost. Picardie reaches full coverage of its bounding box at z14, so below
-that it is exactly ×4: z10 is 270 tiles, z17 would be 1,042,860.
+that it is exactly ×4: z10 is 270 tiles, z15 would be some 65,000.
 
 What keeps the deep end affordable is that the *areal* layers stop early.
-`land` and `landuse` tile everything, so at z17 a million tiles would exist to
+`land` and `landuse` tile everything, so at z15 sixty thousand tiles would exist to
 say "still farmland"; buildings and roads are sparse — they exist where people
 do. `BACKGROUND_MAXZOOM = 12` caps the areal layers, and the viewer keeps that
 rung's tiles underneath as the ground.
@@ -439,8 +451,9 @@ runs it against the archives that actually shipped.
 
 ## Notes and limitations
 
-**The rungs are z10, z12, z15, z17** (`ZOOMS` in `tuning.rs`). Past the deepest
-the viewer overzooms once, reusing z17 scaled 2× to reach the 192 m view.
+**The rungs are z10, z12, z15** (`ZOOMS` in `tuning.rs`), the deepest drawn for
+z16 (`DETAIL`). Past it the viewer overzooms three times (`OVERZOOM` in
+`minimap.js`), reaching the 192 m view with the z16 geometry at 4×.
 
 **The deepest rung is the main cost dial**, because the size filter is derived
 from it. At z12 a tile spans ~6.3 km at latitude 50°, so a 10 m building is
@@ -756,7 +769,7 @@ structures that were expected to stop it did not: the extractor's node array
 and way references are sized per region, and a region at a time is what the
 load does. What still scales badly is the tile count at the deepest rung, and
 the lever for that is in `tuning.rs`, not in the code: each rung is ~4x the
-one above it, so dropping z17 divides the build by about four. Baking on
+one above it, so lowering `DETAIL` divides the deep end by about four. Baking on
 demand (DuckDB can produce a tile per request with the same `ST_AsMVT` call,
 just not stored) is the other trade, and the one this design deliberately does
 not make, because it would put the database on the serving machine.

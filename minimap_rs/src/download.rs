@@ -111,15 +111,22 @@ pub fn run(cfg: &Config, names: &[String], land: bool, europe: bool) -> Result<(
 
     if !solo {
         let sizes = Mutex::new(0u64);
-        let probe = AtomicUsize::new(0);
+        let asked = AtomicUsize::new(0);
         progress::line("asking how big they are ...");
         std::thread::scope(|scope| {
             for _ in 0..cfg.jobs.clamp(1, wants.len()) {
                 scope.spawn(|| loop {
-                    let i = probe.fetch_add(1, Ordering::Relaxed);
+                    let i = asked.fetch_add(1, Ordering::Relaxed);
                     let Some(want) = wants.get(i) else { return };
-                    let remote = content_length(&want.url).ok().flatten().unwrap_or(0);
-                    let have = std::fs::metadata(&want.dest).map(|m| m.len()).unwrap_or(0);
+                    // A finished file is not fetched again; a fragment counts
+                    // what it still lacks, assuming the version holds.
+                    if want.dest.exists() {
+                        continue;
+                    }
+                    let remote = probe(&want.url).ok().and_then(|r| r.len).unwrap_or(0);
+                    let have = std::fs::metadata(part_of(&want.dest))
+                        .map(|m| m.len())
+                        .unwrap_or(0);
                     *sizes.lock().unwrap() += remote.saturating_sub(have.min(remote));
                 });
             }
@@ -191,23 +198,80 @@ fn adopt(from: &Path, to: &Path) -> Result<&'static str, Error> {
 /// restarts, so five attempts is five chances at the remaining bytes.
 const ATTEMPTS: u32 = 5;
 
-fn fetch(want: &Want, bar: bool, prefix: &str) -> Result<(), Error> {
-    let remote = content_length(&want.url)?;
-    let have = std::fs::metadata(&want.dest).map(|m| m.len()).unwrap_or(0);
+/// Where a transfer writes until it is complete: `<dest>.part`. Only a finished
+/// file ever has its real name, so a file under that name is never a fragment
+/// -- not to `fetch`, not to make's `$(PBF)/%.osm.pbf` rule, and not to
+/// `collect_pbfs`, which only takes names ending in `.osm.pbf`.
+fn part_of(dest: &Path) -> PathBuf {
+    let mut name = dest.as_os_str().to_owned();
+    name.push(".part");
+    PathBuf::from(name)
+}
 
-    // Complete already. Compared against the server's own length rather than
-    // "the file exists", because the file existing is exactly what a killed
-    // transfer leaves behind.
-    if let Some(remote) = remote {
-        if have == remote && remote > 0 {
-            println!("    {prefix} have  {:>9}", progress::bytes(have));
-            return Ok(());
+/// Beside a `.part`: the validator of the version its bytes came from, which a
+/// resume sends back as `If-Range`.
+fn validator_of(part: &Path) -> PathBuf {
+    let mut name = part.as_os_str().to_owned();
+    name.push(".validator");
+    PathBuf::from(name)
+}
+
+/// What a HEAD or a GET says about the file on the server.
+#[derive(Debug, Clone, PartialEq)]
+struct Remote {
+    len: Option<u64>,
+    /// A strong ETag, else Last-Modified: what `If-Range` accepts. A weak ETag
+    /// is not one -- RFC 9110 refuses it there -- so it is passed over.
+    validator: Option<String>,
+}
+
+impl Remote {
+    fn of(headers: &ureq::http::HeaderMap) -> Remote {
+        let get = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+        Remote {
+            len: get("content-length").and_then(|v| v.parse().ok()),
+            validator: validator(get("etag"), get("last-modified")),
         }
+    }
+}
+
+fn validator(etag: Option<&str>, last_modified: Option<&str>) -> Option<String> {
+    etag.filter(|e| e.starts_with('"'))
+        .or(last_modified)
+        .map(str::to_string)
+}
+
+/// Fetch one file, resuming a `.part` only while the server still has the
+/// version its bytes came from.
+///
+/// Size alone cannot say that. Geofabrik republishes every extract daily, and
+/// a `Range` request against a newer file appends the new file's tail to the
+/// old one's head: the right length, no error, and a corrupt extract. So the
+/// resume carries `If-Range` with the validator recorded when the bytes were
+/// first written, and a server whose file has changed answers with the whole
+/// new one instead, which is written over the fragment.
+///
+/// A finished file is a snapshot and is left alone: to fetch the current one,
+/// delete it.
+fn fetch(want: &Want, bar: bool, prefix: &str) -> Result<(), Error> {
+    if let Ok(meta) = std::fs::metadata(&want.dest) {
+        let remote = probe(&want.url).ok().and_then(|r| r.len);
+        if remote.is_some_and(|r| r != meta.len()) {
+            progress::warn(format!(
+                "{}: kept the copy on disk, {} where the server now has {} \
+                 -- delete it to fetch the current one",
+                want.label,
+                progress::bytes(meta.len()),
+                progress::bytes(remote.unwrap_or(0)),
+            ));
+        }
+        println!("    {prefix} have  {:>9}", progress::bytes(meta.len()));
+        return Ok(());
     }
 
     let mut last: Option<Error> = None;
     for attempt in 1..=ATTEMPTS {
-        match attempt_fetch(want, bar, prefix, remote) {
+        match attempt_fetch(want, bar, prefix) {
             Ok(()) => return Ok(()),
             Err(e) => {
                 if attempt < ATTEMPTS {
@@ -224,33 +288,65 @@ fn fetch(want: &Want, bar: bool, prefix: &str) -> Result<(), Error> {
     Err(last.unwrap_or_else(|| "download failed".into()))
 }
 
-fn attempt_fetch(want: &Want, bar: bool, prefix: &str, remote: Option<u64>) -> Result<(), Error> {
-    let have = std::fs::metadata(&want.dest).map(|m| m.len()).unwrap_or(0);
+fn attempt_fetch(want: &Want, bar: bool, prefix: &str) -> Result<(), Error> {
+    let part = part_of(&want.dest);
+    let stamp = validator_of(&part);
+    let have = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+    let recorded = std::fs::read_to_string(&stamp)
+        .ok()
+        .filter(|v| !v.is_empty());
     let t0 = Instant::now();
 
-    // Ask to continue rather than to start. A server that will not (no 206)
-    // gets us a 200 and a full body, which the `resumed` check below turns back
-    // into a truncating write, so a missing Range never corrupts a file.
+    // A fragment whose version is known is complete already if the server
+    // still has that version at that length -- a run killed between the last
+    // byte and the rename. Asking for `bytes=<len>-` would be a 416.
+    let remote = probe(&want.url)?;
+    if have > 0 && recorded.is_some() && recorded == remote.validator && remote.len == Some(have) {
+        return finish(&part, &stamp, &want.dest);
+    }
+
+    // Continue only from bytes of a known version, and only if it is still the
+    // server's: `If-Range` turns the 206 into a 200 and the whole current file
+    // when it is not. A fragment with no recorded version starts over.
     let mut request = ureq::get(&want.url);
-    if have > 0 {
-        request = request.header("Range", &format!("bytes={have}-"));
+    let resuming = have > 0 && recorded.is_some();
+    if resuming {
+        request = request
+            .header("Range", &format!("bytes={have}-"))
+            .header("If-Range", recorded.as_deref().unwrap_or_default());
     }
     let response = request.call()?;
-    let resumed = response.status() == 206;
-    let body_len: Option<u64> = response
-        .headers()
-        .get("content-length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse().ok());
-    let total = remote.or_else(|| body_len.map(|n| n + if resumed { have } else { 0 }));
+    let resumed = resuming && response.status() == 206;
+    if resumed {
+        let range = response
+            .headers()
+            .get("content-range")
+            .and_then(|v| v.to_str().ok());
+        if range_start(range) != Some(have) {
+            return Err(format!("asked to resume at {have}, the server sent {range:?}").into());
+        }
+    }
+    let got = Remote::of(response.headers());
+    let total = if resumed {
+        got.len.map(|n| n + have)
+    } else {
+        got.len
+    };
 
     if let Some(parent) = want.dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let mut file = if resumed {
-        std::fs::OpenOptions::new().append(true).open(&want.dest)?
+        std::fs::OpenOptions::new().append(true).open(&part)?
     } else {
-        std::fs::File::create(&want.dest)?
+        // A new version: its validator is written before its first byte, so
+        // no fragment on disk is ever without the version it belongs to.
+        let _ = std::fs::remove_file(&stamp);
+        let file = std::fs::File::create(&part)?;
+        if let Some(v) = got.validator.as_ref().or(remote.validator.as_ref()) {
+            std::fs::write(&stamp, v)?;
+        }
+        file
     };
     let done_before = if resumed { have } else { 0 };
     if !bar {
@@ -299,6 +395,7 @@ fn attempt_fetch(want: &Want, bar: bool, prefix: &str, remote: Option<u64>) -> R
             .into());
         }
     }
+    finish(&part, &stamp, &want.dest)?;
 
     match meter {
         Some(m) => m.finish(),
@@ -311,13 +408,27 @@ fn attempt_fetch(want: &Want, bar: bool, prefix: &str, remote: Option<u64>) -> R
     Ok(())
 }
 
-fn content_length(url: &str) -> Result<Option<u64>, Error> {
+/// The fragment is the file: give it its name, and drop its version stamp.
+fn finish(part: &Path, stamp: &Path, dest: &Path) -> Result<(), Error> {
+    std::fs::rename(part, dest)?;
+    let _ = std::fs::remove_file(stamp);
+    Ok(())
+}
+
+/// The first byte of a `Content-Range: bytes <first>-<last>/<len>`.
+fn range_start(header: Option<&str>) -> Option<u64> {
+    header?
+        .strip_prefix("bytes ")?
+        .split('-')
+        .next()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn probe(url: &str) -> Result<Remote, Error> {
     let response = ureq::head(url).call()?;
-    Ok(response
-        .headers()
-        .get("content-length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse().ok()))
+    Ok(Remote::of(response.headers()))
 }
 
 // --- Geofabrik's catalogue -------------------------------------------------
@@ -446,4 +557,179 @@ pub fn list(cfg: &Config) -> Result<(), Error> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::BufRead;
+    use std::net::TcpListener;
+    use std::sync::Arc;
+
+    /// One file behind HTTP/1.1, honouring `Range: bytes=N-` and `If-Range` the
+    /// way Geofabrik does: a resume against a changed file gets the whole new
+    /// one with a 200. `serve` swaps the file between requests.
+    struct Server {
+        url: String,
+        file: Arc<Mutex<(Vec<u8>, String)>>,
+        ranges: Arc<AtomicUsize>,
+    }
+
+    impl Server {
+        fn start(body: &[u8], etag: &str) -> Server {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/x.osm.pbf", listener.local_addr().unwrap());
+            let file = Arc::new(Mutex::new((body.to_vec(), etag.to_string())));
+            let ranges = Arc::new(AtomicUsize::new(0));
+            let (f, r) = (file.clone(), ranges.clone());
+            std::thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    let head = line.starts_with("HEAD");
+                    let (mut range, mut if_range) = (None, None);
+                    loop {
+                        let mut h = String::new();
+                        reader.read_line(&mut h).unwrap();
+                        let h = h.trim_end();
+                        if h.is_empty() {
+                            break;
+                        }
+                        let (k, v) = h.split_once(':').unwrap();
+                        match k.to_ascii_lowercase().as_str() {
+                            "range" => range = v.trim().strip_prefix("bytes=").map(str::to_string),
+                            "if-range" => if_range = Some(v.trim().to_string()),
+                            _ => {}
+                        }
+                    }
+                    let (body, etag) = f.lock().unwrap().clone();
+                    let from = range
+                        .and_then(|r| r.trim_end_matches('-').parse::<usize>().ok())
+                        .filter(|_| if_range.as_deref().is_none_or(|v| v == etag));
+                    let mut out = stream;
+                    let (status, part, extra) = match from {
+                        Some(n) => {
+                            r.fetch_add(1, Ordering::Relaxed);
+                            let range = format!(
+                                "Content-Range: bytes {n}-{}/{}\r\n",
+                                body.len() - 1,
+                                body.len()
+                            );
+                            ("206 Partial Content", &body[n..], range)
+                        }
+                        None => ("200 OK", &body[..], String::new()),
+                    };
+                    let _ = write!(
+                        out,
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nETag: {etag}\r\n{extra}Connection: close\r\n\r\n",
+                        part.len()
+                    );
+                    if !head {
+                        let _ = out.write_all(part);
+                    }
+                }
+            });
+            Server { url, file, ranges }
+        }
+
+        fn serve(&self, body: &[u8], etag: &str) {
+            *self.file.lock().unwrap() = (body.to_vec(), etag.to_string());
+        }
+    }
+
+    fn want(dir: &Path, url: &str) -> Want {
+        Want {
+            label: "x".into(),
+            url: url.into(),
+            dest: dir.join("x.osm.pbf"),
+        }
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("minimap-dl-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_fragment_of_the_same_version_resumes_and_takes_its_name() {
+        let server = Server::start(b"0123456789", "\"v1\"");
+        let dir = scratch("same");
+        let w = want(&dir, &server.url);
+        std::fs::write(part_of(&w.dest), b"0123").unwrap();
+        std::fs::write(validator_of(&part_of(&w.dest)), "\"v1\"").unwrap();
+
+        fetch(&w, false, "").unwrap();
+        assert_eq!(std::fs::read(&w.dest).unwrap(), b"0123456789");
+        assert_eq!(server.ranges.load(Ordering::Relaxed), 1, "it resumed");
+        assert!(!part_of(&w.dest).exists() && !validator_of(&part_of(&w.dest)).exists());
+    }
+
+    /// The bug this module exists to not have: the server's file grew since the
+    /// fragment was written, and a plain Range would have glued its tail on.
+    #[test]
+    fn a_fragment_of_a_changed_file_is_replaced_not_extended() {
+        let server = Server::start(b"0123", "\"v1\"");
+        let dir = scratch("changed");
+        let w = want(&dir, &server.url);
+        std::fs::write(part_of(&w.dest), b"01").unwrap();
+        std::fs::write(validator_of(&part_of(&w.dest)), "\"v1\"").unwrap();
+        server.serve(b"ABCDEFGHIJ", "\"v2\"");
+
+        fetch(&w, false, "").unwrap();
+        assert_eq!(std::fs::read(&w.dest).unwrap(), b"ABCDEFGHIJ");
+        assert_eq!(
+            server.ranges.load(Ordering::Relaxed),
+            0,
+            "nothing was appended"
+        );
+    }
+
+    #[test]
+    fn a_fragment_with_no_recorded_version_starts_over() {
+        let server = Server::start(b"0123456789", "\"v1\"");
+        let dir = scratch("unknown");
+        let w = want(&dir, &server.url);
+        std::fs::write(part_of(&w.dest), b"XX").unwrap();
+
+        fetch(&w, false, "").unwrap();
+        assert_eq!(std::fs::read(&w.dest).unwrap(), b"0123456789");
+        assert_eq!(server.ranges.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a_finished_file_is_kept_even_when_the_server_has_moved_on() {
+        let server = Server::start(b"a newer, longer extract", "\"v2\"");
+        let dir = scratch("kept");
+        let w = want(&dir, &server.url);
+        std::fs::write(&w.dest, b"the snapshot").unwrap();
+
+        fetch(&w, false, "").unwrap();
+        assert_eq!(std::fs::read(&w.dest).unwrap(), b"the snapshot");
+    }
+
+    #[test]
+    fn a_fragment_complete_but_not_renamed_is_finished_without_a_request() {
+        let server = Server::start(b"0123", "\"v1\"");
+        let dir = scratch("done");
+        let w = want(&dir, &server.url);
+        std::fs::write(part_of(&w.dest), b"0123").unwrap();
+        std::fs::write(validator_of(&part_of(&w.dest)), "\"v1\"").unwrap();
+
+        fetch(&w, false, "").unwrap();
+        assert_eq!(std::fs::read(&w.dest).unwrap(), b"0123");
+    }
+
+    #[test]
+    fn if_range_takes_a_strong_etag_else_last_modified() {
+        let lm = Some("Sat, 11 Oct 2026 01:02:03 GMT");
+        assert_eq!(validator(Some("\"abc\""), lm).as_deref(), Some("\"abc\""));
+        assert_eq!(validator(Some("W/\"abc\""), lm), lm.map(str::to_string));
+        assert_eq!(validator(None, None), None);
+        assert_eq!(range_start(Some("bytes 4-9/10")), Some(4));
+        assert_eq!(range_start(Some("bytes */10")), None);
+        assert_eq!(range_start(None), None);
+    }
 }

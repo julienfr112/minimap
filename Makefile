@@ -375,7 +375,7 @@ clean-%:
 
 # What a machine that built the map and now only serves it can drop: the
 # database is pure scaffolding once the archives exist -- 154 GB standing in
-# for 29 GB. `make serve` still works afterwards; the next `make all` or
+# for 11 GB. `make serve` still works afterwards; the next `make all` or
 # `make anon` re-runs load, as it must.
 prune: clean-duckdb clean-log
 	@echo "kept $(PMTILES)$(if $(wildcard $(ANON)), and $(ANON),) -- still serves: make serve"
