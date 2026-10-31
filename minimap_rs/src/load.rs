@@ -80,24 +80,7 @@ pub fn run(cfg: &Config, con: &Connection, regions: &[Region]) -> Result<(), Err
     let tail = 0.15 * bytes + 80e6;
     progress::begin(bytes + tail);
 
-    // The subdivision markers describe the `features` table this replaces:
-    // left behind, they tell `subdivide` the fresh, uncut land and water were
-    // already cut, and the bake then clips whole seas tile by tile.
-    con.execute_batch(
-        "DROP TABLE IF EXISTS features;
-         DROP TABLE IF EXISTS land_subdivided;
-         DROP TABLE IF EXISTS water_subdivided;
-         CREATE TABLE features (
-            layer   VARCHAR,
-            cls     VARCHAR,
-            minzoom UTINYINT,
-            name    VARCHAR,
-            osm_id  BIGINT,
-            geom    GEOMETRY,
-            min_x   DOUBLE, min_y DOUBLE, max_x DOUBLE, max_y DOUBLE,
-            cell    BIGINT
-         )",
-    )?;
+    fresh_features(con)?;
     // Used by every per-region insert below to compute `cell`.
     con.execute_batch(tuning::BIT_SPREAD_MACRO)?;
 
@@ -278,6 +261,31 @@ pub fn places(con: &Connection, regions: &[Region], weight: f64) -> Result<(), E
         t0,
     );
     progress::tick(weight);
+    Ok(())
+}
+
+/// An empty `features` table, and nothing left that describes the one it
+/// replaces.
+///
+/// The subdivision markers are part of that description: left behind, they
+/// tell [`subdivide`] the fresh, uncut land and water were already cut, and
+/// the bake then clips whole seas tile by tile.
+fn fresh_features(con: &Connection) -> Result<(), Error> {
+    con.execute_batch(
+        "DROP TABLE IF EXISTS features;
+         DROP TABLE IF EXISTS land_subdivided;
+         DROP TABLE IF EXISTS water_subdivided;
+         CREATE TABLE features (
+            layer   VARCHAR,
+            cls     VARCHAR,
+            minzoom UTINYINT,
+            name    VARCHAR,
+            osm_id  BIGINT,
+            geom    GEOMETRY,
+            min_x   DOUBLE, min_y DOUBLE, max_x DOUBLE, max_y DOUBLE,
+            cell    BIGINT
+         )",
+    )?;
     Ok(())
 }
 
@@ -692,5 +700,35 @@ mod tests {
             )
             .unwrap();
         assert_eq!(again, n);
+    }
+
+    /// A reload starts from uncut features, so it must not inherit the
+    /// marker that says they were cut: the second load's monster shatters
+    /// as the first one's did.
+    #[test]
+    fn a_reload_cuts_its_water_again() {
+        let con = Connection::open_in_memory().unwrap();
+        con.execute_batch("INSTALL spatial; LOAD spatial;").unwrap();
+        let load_monster = |con: &Connection| {
+            fresh_features(con).unwrap();
+            con.execute_batch(
+                "INSERT INTO features
+                 SELECT 'water', 'water', 10, NULL, 42, geom,
+                        ST_XMin(geom), ST_YMin(geom), ST_XMax(geom), ST_YMax(geom), NULL
+                 FROM (SELECT ST_GeomFromText(
+                     'POLYGON((0 0, 50000 0, 50000 50000, 0 50000, 0 0))') AS geom)",
+            )
+            .unwrap();
+            subdivide(con, "water", 0.0).unwrap();
+            con.query_row("SELECT count(*) FROM features", [], |r| r.get::<_, i64>(0))
+                .unwrap()
+        };
+        let first = load_monster(&con);
+        assert!(first > 1, "the first load cuts the monster, got {first}");
+        assert_eq!(
+            load_monster(&con),
+            first,
+            "the reload left its monster whole"
+        );
     }
 }
